@@ -1,20 +1,28 @@
 import OptionChainClient from "../../nifty/option-chain/OptionChainClient";
 import PcrTableClient from "../../PcrTableClient";
+import { headers } from "next/headers";
 
 async function getOptionChain() {
-  const base = process.env.NEXTAUTH_URL || "http://localhost:5000";
-  const key = process.env.UPSTOX_SENSEX_KEY || "BSE_INDEX|SENSEX";
-  const url = new URL("/api/nifty/option-chain", base);
-  url.searchParams.set("instrument_key", key);
-  url.searchParams.set("include_history", "1");
-  const res = await fetch(url.toString(), {
-    cache: "no-store"
-  });
-  if (!res.ok) {
-    const error = await res.json().catch(() => ({}));
-    return { error: error?.error || "Failed to load option chain" };
+  try {
+    const h = await headers();
+    const host = h.get("x-forwarded-host") || h.get("host");
+    const proto = h.get("x-forwarded-proto") || "https";
+    const base = process.env.NEXTAUTH_URL || (host ? `${proto}://${host}` : "http://localhost:5000");
+    const key = process.env.UPSTOX_SENSEX_KEY || "BSE_INDEX|SENSEX";
+    const url = new URL("/api/nifty/option-chain", base);
+    url.searchParams.set("instrument_key", key);
+    url.searchParams.set("include_history", "1");
+    const res = await fetch(url.toString(), {
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({}));
+      return { error: error?.error || "Failed to load option chain" };
+    }
+    return res.json();
+  } catch {
+    return { error: "Failed to load option chain" };
   }
-  return res.json();
 }
 
 export default async function SensexOptionChainPage() {

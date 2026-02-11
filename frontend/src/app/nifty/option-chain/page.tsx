@@ -1,18 +1,26 @@
 import OptionChainClient from "./OptionChainClient";
 import PcrTableClient from "../../PcrTableClient";
+import { headers } from "next/headers";
 
 async function getOptionChain() {
-  const baseUrl = process.env.NEXTAUTH_URL || "http://localhost:5000";
-  const url = new URL("/api/nifty/option-chain", baseUrl);
-  url.searchParams.set("include_history", "1");
-  const res = await fetch(url.toString(), {
-    cache: "no-store"
-  });
-  if (!res.ok) {
-    const error = await res.json().catch(() => ({}));
-    return { error: error?.error || "Failed to load option chain" };
+  try {
+    const h = await headers();
+    const host = h.get("x-forwarded-host") || h.get("host");
+    const proto = h.get("x-forwarded-proto") || "https";
+    const baseUrl = process.env.NEXTAUTH_URL || (host ? `${proto}://${host}` : "http://localhost:5000");
+    const url = new URL("/api/nifty/option-chain", baseUrl);
+    url.searchParams.set("include_history", "1");
+    const res = await fetch(url.toString(), {
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({}));
+      return { error: error?.error || "Failed to load option chain" };
+    }
+    return res.json();
+  } catch {
+    return { error: "Failed to load option chain" };
   }
-  return res.json();
 }
 
 export default async function NiftyOptionChainPage() {
