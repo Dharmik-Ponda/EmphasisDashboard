@@ -384,8 +384,8 @@ export default function OptionChainClient({
         const next = await res.json();
         if (!cancelled && res.ok) {
           if (prevChainData.current && prevChainData.current.length > 0) {
-            const callThreshold = maxCallOiChg * 0.10;
-            const putThreshold = maxPutOiChg * 0.10;
+            const callThreshold = maxCallOiChg * 0.05;
+            const putThreshold = maxPutOiChg * 0.05;
 
             const prevDataMap = new Map(
               prevChainData.current.map((row) => [row.strike, row])
@@ -678,7 +678,7 @@ export default function OptionChainClient({
                   <td className="calls">{formatNumber(callTheta)}</td>
                   <td className="calls">{formatNumber(callDelta)}</td>
                   <td className={`calls ${highlights[row.strike]?.call || ""}`}>
-                    <div className={`oi-bar call ${callOiChg >= 0 ? "pos" : "neg"}`}>
+                    <div className={`oi-bar call ${(callOiChg ?? 0) >= 0 ? "pos" : "neg"}`}>
                       <span style={{ width: `${callOiChgPct}%` }} />
                     </div>
                     {formatCompact(callOiChg)}
@@ -701,7 +701,7 @@ export default function OptionChainClient({
                     {formatCompact(oiLakhs(putOi))}
                   </td>
                   <td className={`puts ${highlights[row.strike]?.put || ""}`}>
-                    <div className={`oi-bar put ${putOiChg >= 0 ? "pos" : "neg"}`}>
+                    <div className={`oi-bar put ${(putOiChg ?? 0) >= 0 ? "pos" : "neg"}`}>
                       <span style={{ width: `${putOiChgPct}%` }} />
                     </div>
                     {formatCompact(putOiChg)}
