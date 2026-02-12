@@ -55,6 +55,13 @@ const oiChange = (market: any) => {
   return pickNumber(market, ["oi_change", "change_in_oi", "oi_change_percentage"]);
 };
 
+const parseThresholdPct = (value: string | undefined, fallbackPct = 5) => {
+  if (!value) return fallbackPct / 100;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallbackPct / 100;
+  return parsed / 100;
+};
+
 type OptionChainData = {
   expiry: string;
   expiries: string[];
@@ -98,6 +105,10 @@ export default function OptionChainClient({
   const [highlights, setHighlights] = useState<
     Record<string, { call?: string; put?: string }>
   >({});
+  const oiChangeThresholdRatio = parseThresholdPct(
+    process.env.NEXT_PUBLIC_OI_CHANGE_THRESHOLD_PCT,
+    5
+  );
 
   const spotPrice = data.underlying ?? data.spot_price ?? null;
   const atmStrike = spotPrice
@@ -384,8 +395,8 @@ export default function OptionChainClient({
         const next = await res.json();
         if (!cancelled && res.ok) {
           if (prevChainData.current && prevChainData.current.length > 0) {
-            const callThreshold = maxCallOiChg * 0.05;
-            const putThreshold = maxPutOiChg * 0.05;
+            const callThreshold = maxCallOiChg * oiChangeThresholdRatio;
+            const putThreshold = maxPutOiChg * oiChangeThresholdRatio;
 
             const prevDataMap = new Map(
               prevChainData.current.map((row) => [row.strike, row])
