@@ -401,8 +401,8 @@ export default function OptionChainClient({
             const prevDataMap = new Map(
               prevChainData.current.map((row) => [row.strike, row])
             );
-            const callChanges: { strike: any; diff: number }[] = [];
-            const putChanges: { strike: any; diff: number }[] = [];
+            const nextCallHighlights: Record<string, string> = {};
+            const nextPutHighlights: Record<string, string> = {};
 
             for (const row of next.chain) {
               const prevRow = prevDataMap.get(row.strike);
@@ -410,71 +410,67 @@ export default function OptionChainClient({
                 const prevCallOiChg = oiChange(getMarket(prevRow.call)) ?? 0;
                 const currentCallOiChg = oiChange(getMarket(row.call)) ?? 0;
                 const callDiff = currentCallOiChg - prevCallOiChg;
-                if (Math.abs(callDiff) > callThreshold) {
-                  callChanges.push({ strike: row.strike, diff: callDiff });
+                if (callDiff >= callThreshold) {
+                  nextCallHighlights[row.strike] = "highlight-green";
+                } else if (callDiff <= -callThreshold) {
+                  nextCallHighlights[row.strike] = "highlight-red";
                 }
 
                 const prevPutOiChg = oiChange(getMarket(prevRow.put)) ?? 0;
                 const currentPutOiChg = oiChange(getMarket(row.put)) ?? 0;
                 const putDiff = currentPutOiChg - prevPutOiChg;
-                if (Math.abs(putDiff) > putThreshold) {
-                  putChanges.push({ strike: row.strike, diff: putDiff });
+                if (putDiff >= putThreshold) {
+                  nextPutHighlights[row.strike] = "highlight-green";
+                } else if (putDiff <= -putThreshold) {
+                  nextPutHighlights[row.strike] = "highlight-red";
                 }
               }
             }
 
-            const topCallChanges = callChanges
-              .sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff))
-              .slice(0, 3);
-            const topPutChanges = putChanges
-              .sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff))
-              .slice(0, 3);
+            const hasNewCallHighlights = Object.keys(nextCallHighlights).length > 0;
+            const hasNewPutHighlights = Object.keys(nextPutHighlights).length > 0;
 
-            if (topCallChanges.length > 0 || topPutChanges.length > 0) {
-              setHighlights((prevHighlights) => {
-                const nextHighlights: Record<string, { call?: string; put?: string }> = {};
+            setHighlights((prevHighlights) => {
+              const merged: Record<string, { call?: string; put?: string }> = {};
 
-                // Determine call highlights for the next state
-                if (topCallChanges.length > 0) {
-                  for (const change of topCallChanges) {
-                    nextHighlights[change.strike] = {
-                      ...(nextHighlights[change.strike] || {}),
-                      call: change.diff > 0 ? "highlight-green" : "highlight-red"
+              if (hasNewCallHighlights) {
+                for (const strike in nextCallHighlights) {
+                  merged[strike] = {
+                    ...(merged[strike] || {}),
+                    call: nextCallHighlights[strike]
+                  };
+                }
+              } else {
+                for (const strike in prevHighlights) {
+                  if (prevHighlights[strike].call) {
+                    merged[strike] = {
+                      ...(merged[strike] || {}),
+                      call: prevHighlights[strike].call
                     };
                   }
-                } else {
-                  for (const strike in prevHighlights) {
-                    if (prevHighlights[strike].call) {
-                      nextHighlights[strike] = {
-                        ...(nextHighlights[strike] || {}),
-                        call: prevHighlights[strike].call
-                      };
-                    }
-                  }
                 }
+              }
 
-                // Determine put highlights for the next state
-                if (topPutChanges.length > 0) {
-                  for (const change of topPutChanges) {
-                    nextHighlights[change.strike] = {
-                      ...(nextHighlights[change.strike] || {}),
-                      put: change.diff > 0 ? "highlight-green" : "highlight-red"
+              if (hasNewPutHighlights) {
+                for (const strike in nextPutHighlights) {
+                  merged[strike] = {
+                    ...(merged[strike] || {}),
+                    put: nextPutHighlights[strike]
+                  };
+                }
+              } else {
+                for (const strike in prevHighlights) {
+                  if (prevHighlights[strike].put) {
+                    merged[strike] = {
+                      ...(merged[strike] || {}),
+                      put: prevHighlights[strike].put
                     };
                   }
-                } else {
-                  for (const strike in prevHighlights) {
-                    if (prevHighlights[strike].put) {
-                      nextHighlights[strike] = {
-                        ...(nextHighlights[strike] || {}),
-                        put: prevHighlights[strike].put
-                      };
-                    }
-                  }
                 }
+              }
 
-                return nextHighlights;
-              });
-            }
+              return merged;
+            });
           }
           prevChainData.current = next.chain;
           setData(next);
