@@ -62,6 +62,15 @@ const parseThresholdPct = (value: string | undefined, fallbackPct = 5) => {
   return parsed / 100;
 };
 
+const diffRatioFromPrev = (prevValue: number, nextValue: number) => {
+  const base = Math.abs(prevValue);
+  if (base === 0) {
+    if (nextValue === 0) return 0;
+    return nextValue > 0 ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
+  }
+  return (nextValue - prevValue) / base;
+};
+
 type OptionChainData = {
   expiry: string;
   expiries: string[];
@@ -395,43 +404,39 @@ export default function OptionChainClient({
         const next = await res.json();
         if (!cancelled && res.ok) {
           if (prevChainData.current && prevChainData.current.length > 0) {
-            const callThreshold = maxCallOiChg * oiChangeThresholdRatio;
-            const putThreshold = maxPutOiChg * oiChangeThresholdRatio;
-
             const prevDataMap = new Map(
               prevChainData.current.map((row) => [row.strike, row])
             );
-            const nextCallHighlights: Record<string, string> = {};
-            const nextPutHighlights: Record<string, string> = {};
+            const nextCallHighlights: Record<string, "highlight-green" | "highlight-red"> = {};
+            const nextPutHighlights: Record<string, "highlight-green" | "highlight-red"> = {};
 
             for (const row of next.chain) {
               const prevRow = prevDataMap.get(row.strike);
               if (prevRow) {
                 const prevCallOiChg = oiChange(getMarket(prevRow.call)) ?? 0;
                 const currentCallOiChg = oiChange(getMarket(row.call)) ?? 0;
-                const callDiff = currentCallOiChg - prevCallOiChg;
-                if (callDiff >= callThreshold) {
-                  nextCallHighlights[row.strike] = "highlight-green";
-                } else if (callDiff <= -callThreshold) {
-                  nextCallHighlights[row.strike] = "highlight-red";
+                const callDiffRatio = diffRatioFromPrev(prevCallOiChg, currentCallOiChg);
+                if (callDiffRatio >= oiChangeThresholdRatio) {
+                  nextCallHighlights[String(row.strike)] = "highlight-green";
+                } else if (callDiffRatio <= -oiChangeThresholdRatio) {
+                  nextCallHighlights[String(row.strike)] = "highlight-red";
                 }
 
                 const prevPutOiChg = oiChange(getMarket(prevRow.put)) ?? 0;
                 const currentPutOiChg = oiChange(getMarket(row.put)) ?? 0;
-                const putDiff = currentPutOiChg - prevPutOiChg;
-                if (putDiff >= putThreshold) {
-                  nextPutHighlights[row.strike] = "highlight-green";
-                } else if (putDiff <= -putThreshold) {
-                  nextPutHighlights[row.strike] = "highlight-red";
+                const putDiffRatio = diffRatioFromPrev(prevPutOiChg, currentPutOiChg);
+                if (putDiffRatio >= oiChangeThresholdRatio) {
+                  nextPutHighlights[String(row.strike)] = "highlight-green";
+                } else if (putDiffRatio <= -oiChangeThresholdRatio) {
+                  nextPutHighlights[String(row.strike)] = "highlight-red";
                 }
               }
             }
 
-            const hasNewCallHighlights = Object.keys(nextCallHighlights).length > 0;
-            const hasNewPutHighlights = Object.keys(nextPutHighlights).length > 0;
-
             setHighlights((prevHighlights) => {
               const merged: Record<string, { call?: string; put?: string }> = {};
+              const hasNewCallHighlights = Object.keys(nextCallHighlights).length > 0;
+              const hasNewPutHighlights = Object.keys(nextPutHighlights).length > 0;
 
               if (hasNewCallHighlights) {
                 for (const strike in nextCallHighlights) {
@@ -484,7 +489,7 @@ export default function OptionChainClient({
       cancelled = true;
       clearInterval(id);
     };
-  }, [activeExpiry]);
+  }, [activeExpiry, instrumentKey, oiChangeThresholdRatio]);
 
   useEffect(() => {
     const id = setInterval(loadLtp, 10000);
