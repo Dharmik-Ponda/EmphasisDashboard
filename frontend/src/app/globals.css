@@ -1873,6 +1873,43 @@ table.chain .strike {
   color: #0b2a6b;
 }
 
+table.chain .strike .strike-main {
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+table.chain .strike .strike-pcr {
+  display: inline-block;
+  margin-top: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid #dbe4ff;
+  background: linear-gradient(180deg, #f8fbff 0%, #eef4ff 100%);
+  color: #1e3a8a;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  line-height: 1.25;
+}
+
+table.chain .strike .strike-pcr.bullish {
+  border-color: #bbf7d0;
+  background: linear-gradient(180deg, #f0fdf4 0%, #dcfce7 100%);
+  color: #166534;
+}
+
+table.chain .strike .strike-pcr.bearish {
+  border-color: #fecdd3;
+  background: linear-gradient(180deg, #fff1f2 0%, #ffe4e6 100%);
+  color: #9f1239;
+}
+
+table.chain .strike .strike-pcr.neutral {
+  border-color: #dbe4ff;
+  background: linear-gradient(180deg, #f8fbff 0%, #eef4ff 100%);
+  color: #1e3a8a;
+}
+
 table.chain .strike-atm {
   background: #fde68a;
   box-shadow: inset 0 0 0 1px #f59e0b;

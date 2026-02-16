@@ -385,7 +385,10 @@ export async function GET(req: Request) {
   }
 
   const record = {
-    Time: new Date().toLocaleTimeString("en-IN"),
+    Time: new Date().toLocaleTimeString("en-IN", {
+      timeZone: "Asia/Kolkata",
+      hour12: true
+    }),
     "PE Total OI Change": formatVolume(pe_all_oi_change_total),
     "CE Total OI Change": formatVolume(ce_all_oi_change_total),
     "PE OI Change (±2)": formatVolume(pe_oi_change_total),

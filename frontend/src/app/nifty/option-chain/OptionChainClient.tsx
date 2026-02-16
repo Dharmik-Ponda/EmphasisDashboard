@@ -782,6 +782,12 @@ export default function OptionChainClient({
               const putOiPct = putOi ? Math.min(100, (putOi / maxPutOi) * 100) : 0;
               const callOiChgPct = callOiChg ? Math.min(100, (Math.abs(callOiChg) / maxCallOiChg) * 100) : 0;
               const putOiChgPct = putOiChg ? Math.min(100, (Math.abs(putOiChg) / maxPutOiChg) * 100) : 0;
+              const putOiPlusChange = (putOi ?? 0) + (putOiChg ?? 0);
+              const callOiPlusChange = (callOi ?? 0) + (callOiChg ?? 0);
+              const strikePcr =
+                callOiPlusChange !== 0 ? putOiPlusChange / callOiPlusChange : null;
+              const strikePcrTone =
+                strikePcr === null ? "neutral" : strikePcr > 1 ? "bullish" : strikePcr < 1 ? "bearish" : "neutral";
 
               const isAtm = atmStrike !== null && row.strike === atmStrike;
               return (
@@ -806,7 +812,10 @@ export default function OptionChainClient({
                   </td>
                   <td className="calls ltp">{formatNumber(callLtp)}</td>
                   <td className={isAtm ? "strike strike-atm" : "strike"}>
-                    {formatNumber(row.strike)}
+                    <div className="strike-main">{formatNumber(row.strike)}</div>
+                    <div className={`strike-pcr ${strikePcrTone}`}>
+                      PCR: {strikePcr === null ? "-" : strikePcr.toFixed(2)}
+                    </div>
                   </td>
                   <td className="puts ltp">{formatNumber(putLtp)}</td>
                   <td className="puts">
