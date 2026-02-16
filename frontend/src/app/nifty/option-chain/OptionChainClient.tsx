@@ -173,6 +173,11 @@ export default function OptionChainClient({
         divergence: false,
         structureView: "NEUTRAL" as const,
         priceState: "NEUTRAL" as const,
+        confirmation: "UNCONFIRMED" as const,
+        action: "WAIT" as const,
+        bannerTitle: "Indecisive",
+        oiFlowSummary: "OI Flow: Insufficient data",
+        highlightSummary: "Highlights: none",
         note: "⚠️ Indecisive — WAIT",
         computedSupport: null,
         computedResistance: null,
@@ -281,34 +286,110 @@ export default function OptionChainClient({
       strongUp &&
       !rejectedFromResistance;
 
+    /* -------- OI FLOW (ATM-WEIGHTED + HIGHLIGHTS) -------- */
+
+    const stepValue = Math.max(data.step || 50, 1);
+    const atm = toNumber(atmStrike);
+    let weightedCallOiChgNearAtm = 0;
+    let weightedPutOiChgNearAtm = 0;
+    let weightedCallHighlights = 0;
+    let weightedPutHighlights = 0;
+
+    for (const row of data.chain) {
+      const strike = toNumber(row.strike);
+      if (strike === null) continue;
+
+      const distSteps = atm !== null ? Math.abs(strike - atm) / stepValue : 0;
+      const weight = 1 / (1 + distSteps);
+      const inNearAtmBand = distSteps <= 5;
+
+      const callChg = oiChange(getMarket(row.call)) ?? 0;
+      const putChgRow = oiChange(getMarket(row.put)) ?? 0;
+
+      if (inNearAtmBand) {
+        weightedCallOiChgNearAtm += callChg * weight;
+        weightedPutOiChgNearAtm += putChgRow * weight;
+      }
+
+      const rowHighlights = highlights[String(row.strike)];
+      if (rowHighlights?.call) weightedCallHighlights += weight;
+      if (rowHighlights?.put) weightedPutHighlights += weight;
+    }
+
+    const oiBalance = weightedPutOiChgNearAtm - weightedCallOiChgNearAtm;
+    const oiDenom =
+      Math.abs(weightedPutOiChgNearAtm) + Math.abs(weightedCallOiChgNearAtm) + 1;
+    const oiBalanceRatio = oiBalance / oiDenom;
+
+    const highlightBalance = weightedPutHighlights - weightedCallHighlights;
+    const highlightDenom = weightedPutHighlights + weightedCallHighlights + 1;
+    const highlightBalanceRatio = highlightBalance / highlightDenom;
+
+    let structureScore = oiBalanceRatio * 0.75 + highlightBalanceRatio * 0.25;
+    if (putAlignment && !callAlignment) structureScore += 0.25;
+    if (callAlignment && !putAlignment) structureScore -= 0.25;
+
     /* -------- STRUCTURE VIEW (DOMINANT) -------- */
 
     let structureView: "BULLISH" | "BEARISH" | "NEUTRAL" = "NEUTRAL";
 
-    if (callAlignment && putAlignment) {
-      structureView =
-        Math.abs(spot - (resistance ?? 0)) <= Math.abs(spot - (support ?? 0))
-          ? "BEARISH"
-          : "BULLISH";
-    } else if (callAlignment) {
-      structureView = "BEARISH";
-    } else if (putAlignment) {
+    if (structureScore >= 0.15) {
       structureView = "BULLISH";
+    } else if (structureScore <= -0.15) {
+      structureView = "BEARISH";
+    }
+
+    let oiFlowSummary = "OI Flow: Balanced";
+    if (structureView === "BULLISH") {
+      oiFlowSummary =
+        Math.abs(structureScore) >= 0.4 ? "OI Flow: Strong Bullish build-up" : "OI Flow: Mild Bullish build-up";
+    } else if (structureView === "BEARISH") {
+      oiFlowSummary =
+        Math.abs(structureScore) >= 0.4 ? "OI Flow: Strong Bearish build-up" : "OI Flow: Mild Bearish build-up";
+    }
+
+    const highlightSummary =
+      weightedCallHighlights + weightedPutHighlights > 0
+        ? `Highlights (ATM-weighted): PUT ${weightedPutHighlights.toFixed(1)} vs CALL ${weightedCallHighlights.toFixed(1)}`
+        : "Highlights: none";
+
+    /* -------- CONFIRMATION LAYER -------- */
+
+    let confirmation: "CONFIRMED" | "UNCONFIRMED" | "CONFLICT" = "UNCONFIRMED";
+
+    if (structureView === "BULLISH") {
+      if (priceState === "STRONG_UP" && !divergence) confirmation = "CONFIRMED";
+      else if (priceState === "STRONG_DOWN" || divergence) confirmation = "CONFLICT";
+    } else if (structureView === "BEARISH") {
+      if (priceState === "STRONG_DOWN" && !divergence) confirmation = "CONFIRMED";
+      else if (priceState === "STRONG_UP" || divergence) confirmation = "CONFLICT";
     }
 
     /* -------- NOTE -------- */
 
-    let note = "⚠️ Indecisive — WAIT";
+    let action: "TRADE_POSSIBLE" | "WAIT" | "NO_TRADE" = "WAIT";
+    let bannerTitle = "Indecisive";
+    let note = "⚠️ OI structure not clear — WAIT";
 
-    if (divergence) {
+    if (structureView === "BULLISH") bannerTitle = "Bullish OI Structure";
+    if (structureView === "BEARISH") bannerTitle = "Bearish OI Structure";
+
+    if (divergence || confirmation === "CONFLICT") {
+      action = "NO_TRADE";
+      bannerTitle = "OI–Price Conflict";
       note = "❌ OI–Price Divergence — NO TRADE";
     } else if (acceptanceZone) {
       note = "⚠️ Price near resistance without rejection — WAIT";
-    } else if (alignment) {
+    } else if (confirmation === "CONFIRMED") {
+      action = "TRADE_POSSIBLE";
       note = "✅ OI–Price Aligned — TRADE POSSIBLE";
+    } else if (structureView !== "NEUTRAL") {
+      note = "⚠️ OI bias present but price confirmation is weak — WAIT";
     }
 
     if (lastDivergenceAt && Date.now() - lastDivergenceAt < divergenceCooldown) {
+      action = "NO_TRADE";
+      bannerTitle = "Recent OI–Price Conflict";
       note = "❌ Recent divergence — NO TRADE";
     }
 
@@ -317,13 +398,28 @@ export default function OptionChainClient({
       divergence,
       structureView,
       priceState,
+      confirmation,
+      action,
+      bannerTitle,
+      oiFlowSummary,
+      highlightSummary,
       note,
       computedSupport: support,
       computedResistance: resistance,
       nearSupport,
       nearResistance
     };
-  }, [data.chain, data.step, history5m, history15m, spotPrice]);
+  }, [
+    atmStrike,
+    data.chain,
+    data.step,
+    divergenceCooldown,
+    highlights,
+    history5m,
+    history15m,
+    lastDivergenceAt,
+    spotPrice
+  ]);
 
 
   const loadExpiry = async (expiry: string, silent = false) => {
@@ -589,18 +685,16 @@ export default function OptionChainClient({
       </div>
       <div
         className={`oi-signal-banner ${
-          signal.divergence ? "diverging" : signal.alignment ? "aligned" : "indecisive"
+          signal.action === "NO_TRADE"
+            ? "diverging"
+            : signal.action === "TRADE_POSSIBLE"
+              ? "aligned"
+              : "indecisive"
         }`}
         title="This signal is based on mismatch between price direction and OI change."
       >
         <div className="oi-signal-main">
-          <div className="oi-signal-badge">
-            {signal.divergence
-              ? "OI–Price Diverging"
-              : signal.alignment
-                ? "OI–Price Aligned"
-                : "Indecisive"}
-          </div>
+          <div className="oi-signal-badge">{signal.bannerTitle}</div>
           <div className="oi-signal-note">{signal.note}</div>
         </div>
         <div className="oi-signal-meta">
@@ -611,10 +705,19 @@ export default function OptionChainClient({
             Support: <strong>{formatNumber(signal.computedSupport)}</strong>
           </span>
           <span>
-            Dominant (Structure): <strong>{signal.structureView}</strong>
+            OI Flow: <strong>{signal.oiFlowSummary.replace("OI Flow: ", "")}</strong>
           </span>
           <span>
-            Price State: <strong>{signal.priceState}</strong>
+            Structure: <strong>{signal.structureView}</strong>
+          </span>
+          <span>
+            Price: <strong>{signal.priceState}</strong>
+          </span>
+          <span>
+            Confirmation: <strong>{signal.confirmation}</strong>
+          </span>
+          <span>
+            {signal.highlightSummary}
           </span>
         </div>
       </div>
