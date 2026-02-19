@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const formatNumber = (value: number | null | undefined) => {
   if (value === null || value === undefined) return "-";
@@ -101,13 +101,6 @@ export default function OptionChainClient({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeExpiry, setActiveExpiry] = useState<string>(initialData.expiry);
-  const [history5m, setHistory5m] = useState(
-    initialData.priceHistory5m ?? initialData.priceHistory ?? []
-  );
-  const [history15m, setHistory15m] = useState(initialData.priceHistory15m ?? []);
-  const [lastDivergenceAt, setLastDivergenceAt] = useState<number | null>(null);
-  const divergenceCooldown = 10 * 60 * 1000; // 10 minutes
-  const prevDivergence = useRef(false);
   const ltpKeys = `${instrumentKey || "NSE_INDEX|Nifty 50"},${vixKey}`;
   const [lastLtpAt, setLastLtpAt] = useState(0);
   const prevChainData = useRef<any[]>([]);
@@ -136,6 +129,7 @@ export default function OptionChainClient({
   const start = atmIndex >= 0 ? Math.max(0, atmIndex - windowSize) : 0;
   const end = atmIndex >= 0 ? Math.min(data.chain.length, atmIndex + windowSize + 1) : data.chain.length;
   const visibleChain = data.chain.slice(start, end);
+  const prevByStrike = new Map(prevChainData.current.map((row) => [String(row.strike), row]));
   const maxCallOi = Math.max(
     1,
     ...data.chain.map((row: any) => {
@@ -164,263 +158,6 @@ export default function OptionChainClient({
       return chg ? Math.abs(chg) : 0;
     })
   );
-
-  const signal = useMemo(() => {
-    const spot = spotPrice;
-    if (!spot || !data.chain.length) {
-      return {
-        alignment: false,
-        divergence: false,
-        structureView: "NEUTRAL" as const,
-        priceState: "NEUTRAL" as const,
-        confirmation: "UNCONFIRMED" as const,
-        action: "WAIT" as const,
-        bannerTitle: "Indecisive",
-        oiFlowSummary: "OI Flow: Insufficient data",
-        highlightSummary: "Highlights: none",
-        note: "⚠️ Indecisive — WAIT",
-        computedSupport: null,
-        computedResistance: null,
-        nearSupport: false,
-        nearResistance: false
-      };
-    }
-
-    const range = 200;
-    const levelBuffer = Math.max(data.step || 50, 20);
-
-    const scan =
-      data.chain.filter((row: any) => {
-        const strike = toNumber(row.strike);
-        return strike !== null && Math.abs(strike - spot) <= range;
-      }) || data.chain;
-
-    let resistance: number | null = null;
-    let support: number | null = null;
-    let maxCall = -Infinity;
-    let maxPut = -Infinity;
-
-    for (const row of scan) {
-      const strike = toNumber(row.strike);
-      if (strike === null) continue;
-
-      const callOi = pickNumber(getMarket(row.call), ["oi", "open_interest"]) || 0;
-      const putOi = pickNumber(getMarket(row.put), ["oi", "open_interest"]) || 0;
-
-      if (callOi > maxCall) {
-        maxCall = callOi;
-        resistance = strike;
-      }
-      if (putOi > maxPut) {
-        maxPut = putOi;
-        support = strike;
-      }
-    }
-
-    const resistanceRow = scan.find((r: any) => r.strike === resistance);
-    const supportRow = scan.find((r: any) => r.strike === support);
-
-    const callOiChg = resistanceRow ? oiChange(getMarket(resistanceRow.call)) ?? 0 : 0;
-    const putOiChgAtRes = resistanceRow ? oiChange(getMarket(resistanceRow.put)) ?? 0 : 0;
-    const putOiChg = supportRow ? oiChange(getMarket(supportRow.put)) ?? 0 : 0;
-
-    const nearResistance = resistance !== null && Math.abs(spot - resistance) <= levelBuffer;
-    const nearSupport = support !== null && Math.abs(spot - support) <= levelBuffer;
-
-    /* -------- PRICE STATE (TACTICAL) -------- */
-
-    const threshold = Math.max(spot * 0.0012, (data.step || 50) * 0.3);
-
-    const candleMove = (candles: typeof history5m) => {
-      if (!candles || candles.length < 2) return "FLAT";
-      const last = candles[candles.length - 1];
-      const prev = candles[candles.length - 2];
-      const delta = last.close - prev.close;
-      if (delta >= threshold) return "UP_STRONG";
-      if (delta <= -threshold) return "DOWN_STRONG";
-      return "FLAT";
-    };
-
-    const move5m = candleMove(history5m);
-    const move15m = candleMove(history15m);
-
-    const strongUp =
-      move5m === "UP_STRONG" && (move15m === "UP_STRONG" || history15m.length === 0);
-    const strongDown =
-      move5m === "DOWN_STRONG" && (move15m === "DOWN_STRONG" || history15m.length === 0);
-
-    let priceState: "STRONG_UP" | "STRONG_DOWN" | "WEAK" | "NEUTRAL" = "NEUTRAL";
-
-    if (strongUp) priceState = "STRONG_UP";
-    else if (strongDown) priceState = "STRONG_DOWN";
-    else if (nearResistance || nearSupport) priceState = "WEAK";
-
-    /* -------- REJECTION / ACCEPTANCE -------- */
-
-    const wickRejection = (candle: any) =>
-      candle &&
-      candle.high - candle.close >= (candle.high - candle.low) * 0.5;
-
-    const last5mCandle = history5m?.[history5m.length - 1];
-    const rejectedFromResistance =
-      strongDown || (last5mCandle ? wickRejection(last5mCandle) : false);
-
-    const acceptanceZone =
-      nearResistance && callOiChg >= 0 && !rejectedFromResistance;
-
-    /* -------- STRUCTURAL ALIGNMENT -------- */
-
-    const callAlignment =
-      nearResistance &&
-      callOiChg >= 0 &&
-      callOiChg >= putOiChgAtRes &&
-      rejectedFromResistance;
-
-    const putAlignment = nearSupport && putOiChg >= 0;
-
-    const alignment = callAlignment || putAlignment;
-
-    const divergence =
-      nearResistance &&
-      callOiChg > 0 &&
-      strongUp &&
-      !rejectedFromResistance;
-
-    /* -------- OI FLOW (ATM-WEIGHTED + HIGHLIGHTS) -------- */
-
-    const stepValue = Math.max(data.step || 50, 1);
-    const atm = toNumber(atmStrike);
-    let weightedCallOiChgNearAtm = 0;
-    let weightedPutOiChgNearAtm = 0;
-    let weightedCallHighlights = 0;
-    let weightedPutHighlights = 0;
-
-    for (const row of data.chain) {
-      const strike = toNumber(row.strike);
-      if (strike === null) continue;
-
-      const distSteps = atm !== null ? Math.abs(strike - atm) / stepValue : 0;
-      const weight = 1 / (1 + distSteps);
-      const inNearAtmBand = distSteps <= 5;
-
-      const callChg = oiChange(getMarket(row.call)) ?? 0;
-      const putChgRow = oiChange(getMarket(row.put)) ?? 0;
-
-      if (inNearAtmBand) {
-        weightedCallOiChgNearAtm += callChg * weight;
-        weightedPutOiChgNearAtm += putChgRow * weight;
-      }
-
-      const rowHighlights = highlights[String(row.strike)];
-      if (rowHighlights?.call) weightedCallHighlights += weight;
-      if (rowHighlights?.put) weightedPutHighlights += weight;
-    }
-
-    const oiBalance = weightedPutOiChgNearAtm - weightedCallOiChgNearAtm;
-    const oiDenom =
-      Math.abs(weightedPutOiChgNearAtm) + Math.abs(weightedCallOiChgNearAtm) + 1;
-    const oiBalanceRatio = oiBalance / oiDenom;
-
-    const highlightBalance = weightedPutHighlights - weightedCallHighlights;
-    const highlightDenom = weightedPutHighlights + weightedCallHighlights + 1;
-    const highlightBalanceRatio = highlightBalance / highlightDenom;
-
-    let structureScore = oiBalanceRatio * 0.75 + highlightBalanceRatio * 0.25;
-    if (putAlignment && !callAlignment) structureScore += 0.25;
-    if (callAlignment && !putAlignment) structureScore -= 0.25;
-
-    /* -------- STRUCTURE VIEW (DOMINANT) -------- */
-
-    let structureView: "BULLISH" | "BEARISH" | "NEUTRAL" = "NEUTRAL";
-
-    if (structureScore >= 0.15) {
-      structureView = "BULLISH";
-    } else if (structureScore <= -0.15) {
-      structureView = "BEARISH";
-    }
-
-    let oiFlowSummary = "OI Flow: Balanced";
-    if (structureView === "BULLISH") {
-      oiFlowSummary =
-        Math.abs(structureScore) >= 0.4 ? "OI Flow: Strong Bullish build-up" : "OI Flow: Mild Bullish build-up";
-    } else if (structureView === "BEARISH") {
-      oiFlowSummary =
-        Math.abs(structureScore) >= 0.4 ? "OI Flow: Strong Bearish build-up" : "OI Flow: Mild Bearish build-up";
-    }
-
-    const highlightSummary =
-      weightedCallHighlights + weightedPutHighlights > 0
-        ? `Highlights (ATM-weighted): PUT ${weightedPutHighlights.toFixed(1)} vs CALL ${weightedCallHighlights.toFixed(1)}`
-        : "Highlights: none";
-
-    /* -------- CONFIRMATION LAYER -------- */
-
-    let confirmation: "CONFIRMED" | "UNCONFIRMED" | "CONFLICT" = "UNCONFIRMED";
-
-    if (structureView === "BULLISH") {
-      if (priceState === "STRONG_UP" && !divergence) confirmation = "CONFIRMED";
-      else if (priceState === "STRONG_DOWN" || divergence) confirmation = "CONFLICT";
-    } else if (structureView === "BEARISH") {
-      if (priceState === "STRONG_DOWN" && !divergence) confirmation = "CONFIRMED";
-      else if (priceState === "STRONG_UP" || divergence) confirmation = "CONFLICT";
-    }
-
-    /* -------- NOTE -------- */
-
-    let action: "TRADE_POSSIBLE" | "WAIT" | "NO_TRADE" = "WAIT";
-    let bannerTitle = "Indecisive";
-    let note = "⚠️ OI structure not clear — WAIT";
-
-    if (structureView === "BULLISH") bannerTitle = "Bullish OI Structure";
-    if (structureView === "BEARISH") bannerTitle = "Bearish OI Structure";
-
-    if (divergence || confirmation === "CONFLICT") {
-      action = "NO_TRADE";
-      bannerTitle = "OI–Price Conflict";
-      note = "❌ OI–Price Divergence — NO TRADE";
-    } else if (acceptanceZone) {
-      note = "⚠️ Price near resistance without rejection — WAIT";
-    } else if (confirmation === "CONFIRMED") {
-      action = "TRADE_POSSIBLE";
-      note = "✅ OI–Price Aligned — TRADE POSSIBLE";
-    } else if (structureView !== "NEUTRAL") {
-      note = "⚠️ OI bias present but price confirmation is weak — WAIT";
-    }
-
-    if (lastDivergenceAt && Date.now() - lastDivergenceAt < divergenceCooldown) {
-      action = "NO_TRADE";
-      bannerTitle = "Recent OI–Price Conflict";
-      note = "❌ Recent divergence — NO TRADE";
-    }
-
-    return {
-      alignment,
-      divergence,
-      structureView,
-      priceState,
-      confirmation,
-      action,
-      bannerTitle,
-      oiFlowSummary,
-      highlightSummary,
-      note,
-      computedSupport: support,
-      computedResistance: resistance,
-      nearSupport,
-      nearResistance
-    };
-  }, [
-    atmStrike,
-    data.chain,
-    data.step,
-    divergenceCooldown,
-    highlights,
-    history5m,
-    history15m,
-    lastDivergenceAt,
-    spotPrice
-  ]);
-
 
   const loadExpiry = async (expiry: string, silent = false) => {
     if (expiry === data.expiry && !silent) return;
@@ -481,8 +218,6 @@ export default function OptionChainClient({
   useEffect(() => {
     setData(initialData);
     setActiveExpiry(initialData.expiry);
-    setHistory5m(initialData.priceHistory5m ?? initialData.priceHistory ?? []);
-    setHistory15m(initialData.priceHistory15m ?? []);
     loadLtp();
   }, [initialData]);
 
@@ -593,39 +328,6 @@ export default function OptionChainClient({
     return () => clearInterval(id);
   }, [lastLtpAt]);
 
-  useEffect(() => {
-    if (signal.divergence && !prevDivergence.current) {
-      setLastDivergenceAt(Date.now());
-    }
-    prevDivergence.current = signal.divergence;
-  }, [signal.divergence]);
-
-  useEffect(() => {
-    let cancelled = false;
-    const loadHistory = async () => {
-      try {
-        const url = new URL("/api/nifty/option-chain", window.location.origin);
-        url.searchParams.set("expiry_date", activeExpiry);
-        url.searchParams.set("include_history", "1");
-        if (instrumentKey) url.searchParams.set("instrument_key", instrumentKey);
-        const res = await fetch(url.toString(), { cache: "no-store" });
-        const next = await res.json();
-        if (!cancelled && res.ok) {
-          setHistory5m(next?.priceHistory5m || []);
-          setHistory15m(next?.priceHistory15m || []);
-        }
-      } catch {
-        // ignore
-      }
-    };
-    loadHistory();
-    const id = setInterval(loadHistory, 60000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [activeExpiry, instrumentKey]);
-
   return (
     <>
       <style>
@@ -684,44 +386,6 @@ export default function OptionChainClient({
           </div>
         </div>
       </div>
-      <div
-        className={`oi-signal-banner ${
-          signal.action === "NO_TRADE"
-            ? "diverging"
-            : signal.action === "TRADE_POSSIBLE"
-              ? "aligned"
-              : "indecisive"
-        }`}
-        title="This signal is based on mismatch between price direction and OI change."
-      >
-        <div className="oi-signal-main">
-          <div className="oi-signal-badge">{signal.bannerTitle}</div>
-          <div className="oi-signal-note">{signal.note}</div>
-        </div>
-        <div className="oi-signal-meta">
-          <span>
-            Resistance: <strong>{formatNumber(signal.computedResistance)}</strong>
-          </span>
-          <span>
-            Support: <strong>{formatNumber(signal.computedSupport)}</strong>
-          </span>
-          <span>
-            OI Flow: <strong>{signal.oiFlowSummary.replace("OI Flow: ", "")}</strong>
-          </span>
-          <span>
-            Structure: <strong>{signal.structureView}</strong>
-          </span>
-          <span>
-            Price: <strong>{signal.priceState}</strong>
-          </span>
-          <span>
-            Confirmation: <strong>{signal.confirmation}</strong>
-          </span>
-          <span>
-            {signal.highlightSummary}
-          </span>
-        </div>
-      </div>
       {error && <p className="error">{error}</p>}
       <div className="table-wrap oc-table-wrap">
         <table className="chain">
@@ -755,6 +419,7 @@ export default function OptionChainClient({
           </thead>
           <tbody>
             {visibleChain.map((row: any) => {
+              const prevRow = prevByStrike.get(String(row.strike));
               const callMarket = getMarket(row.call);
               const callGreeks = getGreeks(row.call);
               const putMarket = getMarket(row.put);
@@ -779,6 +444,8 @@ export default function OptionChainClient({
               const putTheta = pickNumber(putGreeks, ["theta"]);
               const putGamma = pickNumber(putGreeks, ["gamma"]);
               const putVega = pickNumber(putGreeks, ["vega"]);
+              const prevCallOiChg = prevRow ? oiChange(getMarket(prevRow.call)) : null;
+              const prevPutOiChg = prevRow ? oiChange(getMarket(prevRow.put)) : null;
               const callOiPct = callOi ? Math.min(100, (callOi / maxCallOi) * 100) : 0;
               const putOiPct = putOi ? Math.min(100, (putOi / maxPutOi) * 100) : 0;
               const callOiChgPct = callOiChg ? Math.min(100, (Math.abs(callOiChg) / maxCallOiChg) * 100) : 0;
@@ -803,7 +470,15 @@ export default function OptionChainClient({
                     <div className={`oi-bar call ${(callOiChg ?? 0) >= 0 ? "pos" : "neg"}`}>
                       <span style={{ width: `${callOiChgPct}%` }} />
                     </div>
-                    {formatCompact(callOiChg)}
+                    <div>
+                      {formatCompact(callOiChg)}
+                      {prevCallOiChg !== null && callOiChg !== null && (
+                        <span style={{ fontSize: "10px", opacity: 0.75 }}>
+                          {" "}
+                          ({formatCompact(prevCallOiChg)})
+                        </span>
+                      )}
+                    </div>
                   </td>
                   <td className="calls">
                     <div className="oi-bar call">
@@ -829,7 +504,15 @@ export default function OptionChainClient({
                     <div className={`oi-bar put ${(putOiChg ?? 0) >= 0 ? "pos" : "neg"}`}>
                       <span style={{ width: `${putOiChgPct}%` }} />
                     </div>
-                    {formatCompact(putOiChg)}
+                    <div>
+                      {formatCompact(putOiChg)}
+                      {prevPutOiChg !== null && putOiChg !== null && (
+                        <span style={{ fontSize: "10px", opacity: 0.75 }}>
+                          {" "}
+                          ({formatCompact(prevPutOiChg)})
+                        </span>
+                      )}
+                    </div>
                   </td>
                   <td className="puts">{formatNumber(putDelta)}</td>
                   <td className="puts">{formatNumber(putTheta)}</td>

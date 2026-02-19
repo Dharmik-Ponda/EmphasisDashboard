@@ -1562,12 +1562,17 @@ body {
 }
 
 .oc-table-wrap {
-  overflow: visible;
+  overflow-x: auto;
+  overflow-y: auto;
   max-height: none;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #fff;
 }
 
 .oc-table-wrap table.chain {
-  width: 100%;
+  width: max(1320px, 100%);
 }
 
 .oc-table-wrap table.chain th,
@@ -1987,4 +1992,62 @@ table.chain td.ltp {
 
 .oi-bar.neg span {
   background: #fca5a5;
+}
+
+@media (max-width: 900px) {
+  .oc-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+
+  .oc-header h1 {
+    font-size: 24px;
+  }
+
+  .right-stack {
+    width: 100%;
+    justify-items: start;
+  }
+
+  .metrics {
+    justify-content: flex-start;
+  }
+
+  .expiry-tabs {
+    width: 100%;
+    justify-content: flex-start;
+    padding: 4px 0 8px;
+  }
+}
+
+@media (max-width: 640px) {
+  .subtitle {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+
+  .oc-table-wrap {
+    margin: 0 -10px;
+    border-radius: 10px;
+  }
+
+  .oc-table-wrap table.chain th,
+  .oc-table-wrap table.chain td {
+    padding: 7px 8px;
+    font-size: 11px;
+  }
+
+  .oc-table-wrap table.chain .strike .strike-main {
+    font-size: 12px;
+  }
+
+  .oc-table-wrap table.chain .strike .strike-pcr {
+    display: none;
+  }
+
+  .oc-table-wrap .oi-bar {
+    height: 6px;
+    margin-bottom: 3px;
+  }
 }
