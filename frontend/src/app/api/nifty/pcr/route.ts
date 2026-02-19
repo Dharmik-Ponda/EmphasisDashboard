@@ -193,13 +193,14 @@ function formatVolume(value: number) {
 }
 
 export async function GET(req: Request) {
-  const accessToken = await getAccessToken();
-  if (!accessToken) {
-    return NextResponse.json(
-      { error: "No access token found. Please login via /upstox/login." },
-      { status: 401 }
-    );
-  }
+  try {
+    const accessToken = await getAccessToken();
+    if (!accessToken) {
+      return NextResponse.json(
+        { error: "No access token found. Please login via /upstox/login." },
+        { status: 401 }
+      );
+    }
 
   const { searchParams } = new URL(req.url);
   const instrumentKey =
@@ -415,25 +416,31 @@ export async function GET(req: Request) {
     if (lastFiveRecords.length > 5) lastFiveRecords.shift();
   }
 
-  return NextResponse.json({
-    records: lastFiveRecords,
-    latest: record,
-    expiry: expiryDate,
-    underlying,
-    vix,
-    vwap,
-    vwapSignal,
-    peBuildUp: { strike: maxPeStrike, oiChange: maxPeOiChange },
-    peReduction: { strike: minPeStrike, oiChange: minPeOiChange },
-    ceBuildUp: { strike: maxCeStrike, oiChange: maxCeOiChange },
-    ceReduction: { strike: minCeStrike, oiChange: minCeOiChange },
-    sentiment: sentiment(record["ALL Change OI PCR"]),
-    trend: trendStrength(record["Current Change OI PCR"]),
-    signals: {
-      pcrSignal,
-      pcrTone,
-      buildUpSignal,
-      buildUpStrike
-    }
-  });
+    return NextResponse.json({
+      records: lastFiveRecords,
+      latest: record,
+      expiry: expiryDate,
+      underlying,
+      vix,
+      vwap,
+      vwapSignal,
+      peBuildUp: { strike: maxPeStrike, oiChange: maxPeOiChange },
+      peReduction: { strike: minPeStrike, oiChange: minPeOiChange },
+      ceBuildUp: { strike: maxCeStrike, oiChange: maxCeOiChange },
+      ceReduction: { strike: minCeStrike, oiChange: minCeOiChange },
+      sentiment: sentiment(record["ALL Change OI PCR"]),
+      trend: trendStrength(record["Current Change OI PCR"]),
+      signals: {
+        pcrSignal,
+        pcrTone,
+        buildUpSignal,
+        buildUpStrike
+      }
+    });
+  } catch (error: any) {
+    return NextResponse.json(
+      { error: "PCR route failed", details: error?.message || String(error) },
+      { status: 500 }
+    );
+  }
 }
