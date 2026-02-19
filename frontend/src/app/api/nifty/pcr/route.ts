@@ -20,6 +20,15 @@ type OptionChainRow = {
 };
 
 let lastFiveRecords: any[] = [];
+const DEDUPE_FIELDS = [
+  "PE Total OI Change",
+  "CE Total OI Change",
+  "PE OI Change (±2)",
+  "CE OI Change (±2)",
+  "ALL Change OI PCR",
+  "Current Change OI PCR",
+  "Current All OI PCR"
+] as const;
 
 async function getAccessToken() {
   const { prisma } = await import("@/lib/prisma");
@@ -398,13 +407,10 @@ export async function GET(req: Request) {
     "Current All OI PCR": +current_all_pcr.toFixed(2)
   };
 
-  const lastRecord = lastFiveRecords[lastFiveRecords.length - 1];
-  if (
-    !lastRecord ||
-    lastRecord["ALL Change OI PCR"] !== record["ALL Change OI PCR"] ||
-    lastRecord["Current Change OI PCR"] !== record["Current Change OI PCR"] ||
-    lastRecord["Current All OI PCR"] !== record["Current All OI PCR"]
-  ) {
+  const isDuplicate = lastFiveRecords.some((existing) =>
+    DEDUPE_FIELDS.every((field) => existing?.[field] === record[field])
+  );
+  if (!isDuplicate) {
     lastFiveRecords.push(record);
     if (lastFiveRecords.length > 5) lastFiveRecords.shift();
   }
