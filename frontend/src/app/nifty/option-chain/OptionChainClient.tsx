@@ -55,7 +55,7 @@ const oiChange = (market: any) => {
   return pickNumber(market, ["oi_change", "change_in_oi", "oi_change_percentage"]);
 };
 
-const parseThresholdPct = (value: string | undefined, fallbackPct = 5) => {
+const parseThresholdPct = (value: string | undefined, fallbackPct = 15) => {
   if (!value) return fallbackPct / 100;
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) return fallbackPct / 100;
@@ -116,7 +116,7 @@ export default function OptionChainClient({
   >({});
   const oiChangeThresholdRatio = parseThresholdPct(
     process.env.NEXT_PUBLIC_OI_CHANGE_THRESHOLD_PCT,
-    5
+    15
   );
 
   const spotPrice = data.underlying ?? data.spot_price ?? null;
@@ -512,6 +512,7 @@ export default function OptionChainClient({
                 const prevCallOiChg = oiChange(getMarket(prevRow.call)) ?? 0;
                 const currentCallOiChg = oiChange(getMarket(row.call)) ?? 0;
                 const callDiffRatio = diffRatioFromPrev(prevCallOiChg, currentCallOiChg);
+
                 if (callDiffRatio >= oiChangeThresholdRatio) {
                   nextCallHighlights[String(row.strike)] = "highlight-green";
                 } else if (callDiffRatio <= -oiChangeThresholdRatio) {
