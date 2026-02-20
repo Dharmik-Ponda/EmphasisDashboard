@@ -104,6 +104,9 @@ export default function OptionChainClient({
   const ltpKeys = `${instrumentKey || "NSE_INDEX|Nifty 50"},${vixKey}`;
   const [lastLtpAt, setLastLtpAt] = useState(0);
   const prevChainData = useRef<any[]>([]);
+  const prevDifferentOiChg = useRef<
+    Record<string, { call?: number | null; put?: number | null }>
+  >({});
   const [highlights, setHighlights] = useState<
     Record<string, { call?: string; put?: string }>
   >({});
@@ -129,7 +132,6 @@ export default function OptionChainClient({
   const start = atmIndex >= 0 ? Math.max(0, atmIndex - windowSize) : 0;
   const end = atmIndex >= 0 ? Math.min(data.chain.length, atmIndex + windowSize + 1) : data.chain.length;
   const visibleChain = data.chain.slice(start, end);
-  const prevByStrike = new Map(prevChainData.current.map((row) => [String(row.strike), row]));
   const maxCallOi = Math.max(
     1,
     ...data.chain.map((row: any) => {
@@ -172,6 +174,8 @@ export default function OptionChainClient({
       });
       const next = await res.json();
       if (!res.ok) throw new Error(next?.error || "Failed to load option chain");
+      prevChainData.current = next.chain;
+      prevDifferentOiChg.current = {};
       setData(next);
       setActiveExpiry(next.expiry || expiry);
     } catch (e: any) {
@@ -216,6 +220,8 @@ export default function OptionChainClient({
   };
 
   useEffect(() => {
+    prevChainData.current = initialData.chain;
+    prevDifferentOiChg.current = {};
     setData(initialData);
     setActiveExpiry(initialData.expiry);
     loadLtp();
@@ -246,6 +252,18 @@ export default function OptionChainClient({
               if (prevRow) {
                 const prevCallOiChg = oiChange(getMarket(prevRow.call)) ?? 0;
                 const currentCallOiChg = oiChange(getMarket(row.call)) ?? 0;
+                const strikeKey = String(row.strike);
+                if (currentCallOiChg !== prevCallOiChg) {
+                  prevDifferentOiChg.current[strikeKey] = {
+                    ...(prevDifferentOiChg.current[strikeKey] || {}),
+                    call: prevCallOiChg
+                  };
+                } else if (prevDifferentOiChg.current[strikeKey]?.call === currentCallOiChg) {
+                  prevDifferentOiChg.current[strikeKey] = {
+                    ...(prevDifferentOiChg.current[strikeKey] || {}),
+                    call: null
+                  };
+                }
                 const callDiffRatio = diffRatioFromPrev(prevCallOiChg, currentCallOiChg);
 
                 if (callDiffRatio >= oiChangeThresholdRatio) {
@@ -256,6 +274,17 @@ export default function OptionChainClient({
 
                 const prevPutOiChg = oiChange(getMarket(prevRow.put)) ?? 0;
                 const currentPutOiChg = oiChange(getMarket(row.put)) ?? 0;
+                if (currentPutOiChg !== prevPutOiChg) {
+                  prevDifferentOiChg.current[strikeKey] = {
+                    ...(prevDifferentOiChg.current[strikeKey] || {}),
+                    put: prevPutOiChg
+                  };
+                } else if (prevDifferentOiChg.current[strikeKey]?.put === currentPutOiChg) {
+                  prevDifferentOiChg.current[strikeKey] = {
+                    ...(prevDifferentOiChg.current[strikeKey] || {}),
+                    put: null
+                  };
+                }
                 const putDiffRatio = diffRatioFromPrev(prevPutOiChg, currentPutOiChg);
                 if (putDiffRatio >= oiChangeThresholdRatio) {
                   nextPutHighlights[String(row.strike)] = "highlight-green";
@@ -419,7 +448,6 @@ export default function OptionChainClient({
           </thead>
           <tbody>
             {visibleChain.map((row: any) => {
-              const prevRow = prevByStrike.get(String(row.strike));
               const callMarket = getMarket(row.call);
               const callGreeks = getGreeks(row.call);
               const putMarket = getMarket(row.put);
@@ -444,8 +472,9 @@ export default function OptionChainClient({
               const putTheta = pickNumber(putGreeks, ["theta"]);
               const putGamma = pickNumber(putGreeks, ["gamma"]);
               const putVega = pickNumber(putGreeks, ["vega"]);
-              const prevCallOiChg = prevRow ? oiChange(getMarket(prevRow.call)) : null;
-              const prevPutOiChg = prevRow ? oiChange(getMarket(prevRow.put)) : null;
+              const prevDiff = prevDifferentOiChg.current[String(row.strike)];
+              const prevCallOiChg = prevDiff?.call ?? null;
+              const prevPutOiChg = prevDiff?.put ?? null;
               const callOiPct = callOi ? Math.min(100, (callOi / maxCallOi) * 100) : 0;
               const putOiPct = putOi ? Math.min(100, (putOi / maxPutOi) * 100) : 0;
               const callOiChgPct = callOiChg ? Math.min(100, (Math.abs(callOiChg) / maxCallOiChg) * 100) : 0;
@@ -472,7 +501,9 @@ export default function OptionChainClient({
                     </div>
                     <div>
                       {formatCompact(callOiChg)}
-                      {prevCallOiChg !== null && callOiChg !== null && (
+                      {prevCallOiChg !== null &&
+                        callOiChg !== null &&
+                        callOiChg !== prevCallOiChg && (
                         <span style={{ fontSize: "10px", opacity: 0.75 }}>
                           {" "}
                           ({formatCompact(prevCallOiChg)})
@@ -506,7 +537,9 @@ export default function OptionChainClient({
                     </div>
                     <div>
                       {formatCompact(putOiChg)}
-                      {prevPutOiChg !== null && putOiChg !== null && (
+                      {prevPutOiChg !== null &&
+                        putOiChg !== null &&
+                        putOiChg !== prevPutOiChg && (
                         <span style={{ fontSize: "10px", opacity: 0.75 }}>
                           {" "}
                           ({formatCompact(prevPutOiChg)})
