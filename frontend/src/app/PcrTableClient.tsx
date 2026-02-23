@@ -3,6 +3,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 type PcrRecord = Record<string, string | number>;
+type DisplayRow = {
+  key: string;
+  seenAt: number;
+  row: PcrRecord;
+};
 
 type PcrResponse = {
   records: PcrRecord[];
@@ -46,12 +51,6 @@ const isRatioColumn = (h: string) =>
 const buildRowKey = (row: PcrRecord) =>
   headers.map((h) => String(row[h] ?? "")).join("|");
 
-const buildRowKeyWithoutTime = (row: PcrRecord) =>
-  headers
-    .filter((h) => h !== "Time")
-    .map((h) => String(row[h] ?? ""))
-    .join("|");
-
 const toNumeric = (value: unknown) => {
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
   if (typeof value === "string") {
@@ -62,6 +61,36 @@ const toNumeric = (value: unknown) => {
 };
 
 const formatPcrTrail = (values: number[]) => values.map((v) => `|${v.toFixed(2)}|`).join(" ");
+const MAX_ROWS = 5;
+const HISTORY_MAX_ROWS = 10000;
+const THREE_MIN_MS = 3 * 60 * 1000;
+const FIVE_MIN_MS = 5 * 60 * 1000;
+const TREND_SOURCE = "ALL Change OI PCR";
+
+const mergeIncomingRows = (previousRows: DisplayRow[], incomingRecords: PcrRecord[]) => {
+  if (!incomingRecords.length) return previousRows;
+
+  // API records are oldest -> latest; preserve that and only append unseen rows.
+  const incomingOrdered = incomingRecords.slice(-MAX_ROWS);
+  const previousKeys = new Set(previousRows.map((item) => item.key));
+  const merged = [...previousRows];
+  const now = Date.now();
+  let offsetMs = 0;
+
+  for (const row of incomingOrdered) {
+    const key = buildRowKey(row);
+    if (previousKeys.has(key)) continue;
+    previousKeys.add(key);
+    merged.push({
+      key,
+      row,
+      seenAt: now + offsetMs
+    });
+    offsetMs += 1;
+  }
+
+  return merged.slice(-HISTORY_MAX_ROWS);
+};
 
 export default function PcrTableClient({
   instrumentKey,
@@ -71,6 +100,7 @@ export default function PcrTableClient({
   title?: string;
 }) {
   const [data, setData] = useState<PcrResponse | null>(null);
+  const [historyRows, setHistoryRows] = useState<DisplayRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [flashKey, setFlashKey] = useState<string | null>(null);
   const lastTopKeyRef = useRef<string | null>(null);
@@ -84,6 +114,7 @@ export default function PcrTableClient({
       const next = await res.json();
       if (!res.ok) throw new Error(next?.error || "Failed to load PCR");
       setData(next);
+      setHistoryRows((prev) => mergeIncomingRows(prev, next?.records || []));
       setError(null);
     } catch (e: any) {
       setError(e?.message || "Failed to load PCR");
@@ -103,112 +134,128 @@ export default function PcrTableClient({
   }, []);
 
   const orderedRows = useMemo(() => {
-    if (!data?.records?.length) return [];
-    const seen = new Set<string>();
-    const rows: PcrRecord[] = [];
-    for (const row of [...data.records].reverse()) {
-      const key = buildRowKeyWithoutTime(row);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      rows.push(row);
-    }
-    return rows;
-  }, [data?.records]);
+    if (!historyRows.length) return [];
+    // Render latest first for table and signals.
+    return historyRows.slice(-MAX_ROWS).map((item) => item.row).reverse();
+  }, [historyRows]);
 
-  const pcrTrendView = useMemo(() => {
-    if (!orderedRows.length) return null;
+  const pcrTrendViews = useMemo(() => {
+    if (!historyRows.length) return null;
 
-    const source = "ALL Change OI PCR";
-    const points = orderedRows
-      .map((row) => toNumeric(row[source]))
-      .filter((v): v is number => v !== null)
-      .slice(0, 5);
+    // Trend source fixed as requested: ALL Change OI PCR across the session/day.
+    const withPcr = historyRows
+      .map((item) => ({
+        seenAt: item.seenAt,
+        value: toNumeric(item.row[TREND_SOURCE])
+      }))
+      .filter((item): item is { seenAt: number; value: number } => item.value !== null);
 
-    if (points.length < 3) {
-      const latest = points[0];
-      return {
-        tone: "neutral" as const,
-        title: "TREND PENDING",
-        subtitle: "Need more ticks",
-        trail: points.length ? formatPcrTrail(points.reverse()) : "-"
-      };
-    }
-
-    const oldestToLatest = [...points].reverse();
-    let upSteps = 0;
-    let downSteps = 0;
-    for (let i = 1; i < oldestToLatest.length; i += 1) {
-      const delta = oldestToLatest[i] - oldestToLatest[i - 1];
-      if (delta >= 0.01) upSteps += 1;
-      if (delta <= -0.01) downSteps += 1;
-    }
-
-    const latest = oldestToLatest[oldestToLatest.length - 1];
-    const oldest = oldestToLatest[0];
-    const slope = latest - oldest;
-    const nearMonotonicUp = upSteps >= oldestToLatest.length - 2;
-    const nearMonotonicDown = downSteps >= oldestToLatest.length - 2;
     const strike = data?.signals?.buildUpStrike ?? null;
+    const trendTrail = withPcr.length ? formatPcrTrail(withPcr.map((p) => p.value).slice(-5)) : "-";
 
-    if (latest <= 0.75) {
-      if (slope >= 0.08 && nearMonotonicUp) {
+    const buildTrendView = (requestedWindowMs: number, label: "3m" | "5m") => {
+      if (withPcr.length < 2) {
         return {
-          tone: "bullish" as const,
-          title: "REVERSAL WATCH",
-          subtitle: `PCR rising from bearish zone${strike ? ` · Strike ${strike}` : ""}`,
-          trail: formatPcrTrail(oldestToLatest)
+          tone: "neutral" as const,
+          title: `${label.toUpperCase()} TREND PENDING`,
+          subtitle: `Need at least 2 ticks (${TREND_SOURCE})`,
+          trail: trendTrail
         };
       }
-      return {
-        tone: "bearish" as const,
-        title: "BEARISH MARKET",
-        subtitle: `Bearish build-up${strike ? ` · Strike ${strike}` : ""}`,
-        trail: formatPcrTrail(oldestToLatest)
-      };
-    }
 
-    if (latest >= 1.25) {
-      if (slope <= -0.12 && nearMonotonicDown) {
+      const latestPoint = withPcr[withPcr.length - 1];
+      const targetTime = latestPoint.seenAt - requestedWindowMs;
+      const baselinePoint =
+        [...withPcr].reverse().find((point) => point.seenAt <= targetTime) || withPcr[0];
+      const windowMs = Math.max(1, latestPoint.seenAt - baselinePoint.seenAt);
+      const windowMin = windowMs / 60000;
+      const suffix = windowMin >= requestedWindowMs / 60000 - 0.5 ? label : `${windowMin.toFixed(1)}m`;
+      const oldestToLatest = withPcr
+        .filter((point) => point.seenAt >= baselinePoint.seenAt)
+        .map((point) => point.value);
+
+      let upSteps = 0;
+      let downSteps = 0;
+      for (let i = 1; i < oldestToLatest.length; i += 1) {
+        const delta = oldestToLatest[i] - oldestToLatest[i - 1];
+        if (delta >= 0.01) upSteps += 1;
+        if (delta <= -0.01) downSteps += 1;
+      }
+
+      const latest = oldestToLatest[oldestToLatest.length - 1];
+      const oldest = oldestToLatest[0];
+      const slope = latest - oldest;
+      const highZoneDropThreshold = label === "3m" ? -0.12 : -0.2;
+      const lowZoneRiseThreshold = label === "3m" ? 0.1 : 0.12;
+      const momentumThreshold = label === "3m" ? 0.08 : 0.1;
+      const nearMonotonicUp = upSteps >= oldestToLatest.length - 2;
+      const nearMonotonicDown = downSteps >= oldestToLatest.length - 2;
+
+      if (latest <= 0.75) {
+        if (slope >= lowZoneRiseThreshold && nearMonotonicUp) {
+          return {
+            tone: "bullish" as const,
+            title: "REVERSAL WATCH",
+            subtitle: `PCR rising from bearish zone (${suffix})${strike ? ` · Strike ${strike}` : ""}`,
+            trail: formatPcrTrail(oldestToLatest)
+          };
+        }
         return {
           tone: "bearish" as const,
-          title: "BEARISH RISK",
-          subtitle: `PCR falling from high zone${strike ? ` · Strike ${strike}` : ""}`,
+          title: "BEARISH MARKET",
+          subtitle: `Bearish build-up (${suffix})${strike ? ` · Strike ${strike}` : ""}`,
           trail: formatPcrTrail(oldestToLatest)
         };
       }
-      return {
-        tone: "bullish" as const,
-        title: "BULLISH MARKET",
-        subtitle: `Bullish build-up${strike ? ` · Strike ${strike}` : ""}`,
-        trail: formatPcrTrail(oldestToLatest)
-      };
-    }
 
-    if (slope >= 0.08 && nearMonotonicUp) {
-      return {
-        tone: "bullish" as const,
-        title: "BULLISH MOMENTUM",
-        subtitle: `PCR climbing${strike ? ` · Strike ${strike}` : ""}`,
-        trail: formatPcrTrail(oldestToLatest)
-      };
-    }
+      if (latest >= 1.25) {
+        if (slope <= highZoneDropThreshold) {
+          return {
+            tone: "bearish" as const,
+            title: "BEARISH RISK",
+            subtitle: `PCR falling from high zone (${suffix})${strike ? ` · Strike ${strike}` : ""}`,
+            trail: formatPcrTrail(oldestToLatest)
+          };
+        }
+        return {
+          tone: "bullish" as const,
+          title: "BULLISH MARKET",
+          subtitle: `Bullish build-up (${suffix})${strike ? ` · Strike ${strike}` : ""}`,
+          trail: formatPcrTrail(oldestToLatest)
+        };
+      }
 
-    if (slope <= -0.08 && nearMonotonicDown) {
+      if (slope >= momentumThreshold && nearMonotonicUp) {
+        return {
+          tone: "bullish" as const,
+          title: "BULLISH MOMENTUM",
+          subtitle: `PCR climbing (${suffix})${strike ? ` · Strike ${strike}` : ""}`,
+          trail: formatPcrTrail(oldestToLatest)
+        };
+      }
+
+      if (slope <= -momentumThreshold && nearMonotonicDown) {
+        return {
+          tone: "bearish" as const,
+          title: "BEARISH MOMENTUM",
+          subtitle: `PCR weakening (${suffix})${strike ? ` · Strike ${strike}` : ""}`,
+          trail: formatPcrTrail(oldestToLatest)
+        };
+      }
+
       return {
-        tone: "bearish" as const,
-        title: "BEARISH MOMENTUM",
-        subtitle: `PCR weakening${strike ? ` · Strike ${strike}` : ""}`,
+        tone: "neutral" as const,
+        title: "SIDEWAYS PCR",
+        subtitle: `No strong direction (${suffix})${strike ? ` · Strike ${strike}` : ""}`,
         trail: formatPcrTrail(oldestToLatest)
       };
-    }
+    };
 
     return {
-      tone: "neutral" as const,
-      title: "SIDEWAYS PCR",
-      subtitle: `No strong direction${strike ? ` · Strike ${strike}` : ""}`,
-      trail: formatPcrTrail(oldestToLatest)
+      trend3m: buildTrendView(THREE_MIN_MS, "3m"),
+      trend5m: buildTrendView(FIVE_MIN_MS, "5m")
     };
-  }, [orderedRows, data?.signals?.buildUpStrike]);
+  }, [historyRows, data?.signals?.buildUpStrike]);
 
   const currentPcrView = useMemo(() => {
     const latest = orderedRows[0];
@@ -239,7 +286,7 @@ export default function PcrTableClient({
 
   useEffect(() => {
     if (!orderedRows.length) return;
-    const topKey = buildRowKeyWithoutTime(orderedRows[0]);
+    const topKey = buildRowKey(orderedRows[0]);
     const lastTopKey = lastTopKeyRef.current;
 
     if (lastTopKey && topKey !== lastTopKey) {
@@ -280,11 +327,18 @@ export default function PcrTableClient({
               <small>{currentPcrView.subtitle}</small>
             </div>
           )}
-          {pcrTrendView && (
-            <div className={`sentiment ${pcrTrendView.tone}`}>
-              <span>{pcrTrendView.title}</span>
-              <small>{pcrTrendView.subtitle}</small>
-              <small className="trend-trail">{pcrTrendView.trail}</small>
+          {pcrTrendViews?.trend3m && (
+            <div className={`sentiment ${pcrTrendViews.trend3m.tone}`}>
+              <span>3M: {pcrTrendViews.trend3m.title}</span>
+              <small>{pcrTrendViews.trend3m.subtitle}</small>
+              <small className="trend-trail">{pcrTrendViews.trend3m.trail}</small>
+            </div>
+          )}
+          {pcrTrendViews?.trend5m && (
+            <div className={`sentiment ${pcrTrendViews.trend5m.tone}`}>
+              <span>5M: {pcrTrendViews.trend5m.title}</span>
+              <small>{pcrTrendViews.trend5m.subtitle}</small>
+              <small className="trend-trail">{pcrTrendViews.trend5m.trail}</small>
             </div>
           )}
         </div>
@@ -300,7 +354,7 @@ export default function PcrTableClient({
           </thead>
           <tbody>
             {orderedRows.map((row, i) => {
-              const rowKey = buildRowKeyWithoutTime(row);
+              const rowKey = buildRowKey(row);
               const isTop = i === 0;
               const isFlash = isTop && flashKey === rowKey;
               const rowClass = isFlash ? "row-atm row-new" : isTop ? "row-atm" : "";
