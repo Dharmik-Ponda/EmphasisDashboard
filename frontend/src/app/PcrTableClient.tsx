@@ -90,6 +90,7 @@ const formatPeakToLatestTrail = (peak: number, latest: number) =>
   `|${peak.toFixed(2)}| -> |${latest.toFixed(2)}|`;
 const formatTroughToLatestTrail = (trough: number, latest: number) =>
   `|${trough.toFixed(2)}| -> |${latest.toFixed(2)}|`;
+const TREND_LOOKBACK_POINTS = 10;
 const MAX_ROWS = 5;
 const HISTORY_MAX_ROWS = 10000;
 const THREE_MIN_MS = 3 * 60 * 1000;
@@ -99,6 +100,7 @@ const MAX_JOURNAL_ROWS = 14;
 const DEFAULT_STRIKE_STEP = 50;
 const OTM_OFFSET_POINTS = 200;
 const HEDGE_OFFSET_POINTS = 200;
+const ITM_CALENDAR_OFFSET_POINTS = 100;
 const MAX_PCR_SAMPLES = 600;
 
 const mergeIncomingRows = (previousRows: DisplayRow[], incomingRecords: PcrRecord[]) => {
@@ -274,52 +276,26 @@ export default function PcrTableClient({
         };
       }
 
-      const oldestToLatest = series.map((point) => point.value);
-
-      let upSteps = 0;
-      let downSteps = 0;
-      for (let i = 1; i < oldestToLatest.length; i += 1) {
-        const delta = oldestToLatest[i] - oldestToLatest[i - 1];
-        if (delta >= 0.01) upSteps += 1;
-        if (delta <= -0.01) downSteps += 1;
-      }
+      const oldestToLatest = series
+        .slice(-TREND_LOOKBACK_POINTS)
+        .map((point) => point.value);
 
       const latest = oldestToLatest[oldestToLatest.length - 1];
       const oldest = oldestToLatest[0];
       const slope = latest - oldest;
       const peak = Math.max(...oldestToLatest);
-      const peakToLatestDrop = latest - peak;
+      const dropFromPeak = peak - latest;
       const trough = Math.min(...oldestToLatest);
-      const troughToLatestRise = latest - trough;
-      const highZoneDropThreshold = -0.1;
-      const lowZoneRiseThreshold = 0.1;
-      const momentumThreshold = label === "3m" ? 0.08 : 0.1;
+      const riseFromTrough = latest - trough;
+      const reversalThreshold = 0.1;
       const neutralSlopeBuffer = 0.06;
-      const nearMonotonicUp = upSteps >= oldestToLatest.length - 2;
-      const nearMonotonicDown = downSteps >= oldestToLatest.length - 2;
-      let recentUpStreak = 0;
-      let recentDownStreak = 0;
-      for (let i = oldestToLatest.length - 1; i > 0; i -= 1) {
-        const delta = oldestToLatest[i] - oldestToLatest[i - 1];
-        if (delta >= 0.01 && recentDownStreak === 0) {
-          recentUpStreak += 1;
-          continue;
-        }
-        if (delta <= -0.01 && recentUpStreak === 0) {
-          recentDownStreak += 1;
-          continue;
-        }
-        break;
-      }
-      const reversalConfirmedUp = nearMonotonicUp && recentUpStreak >= 2;
-      const reversalConfirmedDown = nearMonotonicDown && recentDownStreak >= 2;
 
       if (latest <= 0.75) {
-        if (troughToLatestRise >= lowZoneRiseThreshold) {
+        if (riseFromTrough >= reversalThreshold) {
           return {
             tone: "bullish",
             title: "BULLISH RISK",
-            subtitle: `PCR rising from low zone (${label} array, trough rise ${troughToLatestRise.toFixed(
+            subtitle: `PCR reversing up from bearish zone (${label} array, trough rise ${riseFromTrough.toFixed(
               2
             )})${strike ? ` · Strike ${strike}` : ""}`,
             trail: formatTroughToLatestTrail(trough, latest),
@@ -330,9 +306,9 @@ export default function PcrTableClient({
         }
         return {
           tone: "bearish",
-          title: "BEARISH MARKET",
-          subtitle: `Bearish build-up (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
-          trail: formatPeakToLatestTrail(peak, latest),
+          title: "BEARISH VIEW CONTINUE",
+          subtitle: `PCR remains in bearish zone (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
+          trail: formatTroughToLatestTrail(trough, latest),
           latest,
           slope,
           windowLabel: label
@@ -340,13 +316,13 @@ export default function PcrTableClient({
       }
 
       if (latest >= 1.25) {
-        if (peakToLatestDrop <= highZoneDropThreshold) {
+        if (dropFromPeak >= reversalThreshold) {
           return {
             tone: "bearish",
             title: "BEARISH RISK",
-            subtitle: `PCR falling from high zone (${label} array, peak drop ${Math.abs(
-              peakToLatestDrop
-            ).toFixed(2)})${strike ? ` · Strike ${strike}` : ""}`,
+            subtitle: `PCR falling from bullish zone (${label} array, peak drop ${dropFromPeak.toFixed(2)})${
+              strike ? ` · Strike ${strike}` : ""
+            }`,
             trail: formatPeakToLatestTrail(peak, latest),
             latest,
             slope,
@@ -355,44 +331,8 @@ export default function PcrTableClient({
         }
         return {
           tone: "bullish",
-          title: "BULLISH MARKET",
-          subtitle: `Bullish build-up (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
-          trail: formatTroughToLatestTrail(trough, latest),
-          latest,
-          slope,
-          windowLabel: label
-        };
-      }
-
-      if (Math.abs(slope) < neutralSlopeBuffer) {
-        return {
-          tone: "neutral",
-          title: "NEUTRAL",
-          subtitle: `Slope too small (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
-          trail: formatPcrTrail(oldestToLatest),
-          latest,
-          slope,
-          windowLabel: label
-        };
-      }
-
-      if (slope >= momentumThreshold && nearMonotonicUp) {
-        return {
-          tone: "bullish",
-          title: "BULLISH MARKET",
-          subtitle: `PCR climbing (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
-          trail: formatTroughToLatestTrail(trough, latest),
-          latest,
-          slope,
-          windowLabel: label
-        };
-      }
-
-      if (slope <= -momentumThreshold && nearMonotonicDown) {
-        return {
-          tone: "bearish",
-          title: "BEARISH MARKET",
-          subtitle: `PCR weakening (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
+          title: "BULLISH VIEW CONTINUE",
+          subtitle: `PCR remains in bullish zone (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
           trail: formatPeakToLatestTrail(peak, latest),
           latest,
           slope,
@@ -400,11 +340,51 @@ export default function PcrTableClient({
         };
       }
 
+      if (dropFromPeak >= reversalThreshold && dropFromPeak >= riseFromTrough) {
+        return {
+          tone: "bearish",
+          title: "BEARISH RISK",
+          subtitle: `PCR pullback from recent peak (${label} array, peak drop ${dropFromPeak.toFixed(2)})${
+            strike ? ` · Strike ${strike}` : ""
+          }`,
+          trail: formatPeakToLatestTrail(peak, latest),
+          latest,
+          slope,
+          windowLabel: label
+        };
+      }
+
+      if (riseFromTrough >= reversalThreshold && riseFromTrough > dropFromPeak) {
+        return {
+          tone: "bullish",
+          title: "BULLISH RISK",
+          subtitle: `PCR bounce from recent trough (${label} array, trough rise ${riseFromTrough.toFixed(2)})${
+            strike ? ` · Strike ${strike}` : ""
+          }`,
+          trail: formatTroughToLatestTrail(trough, latest),
+          latest,
+          slope,
+          windowLabel: label
+        };
+      }
+
+      if (slope >= -neutralSlopeBuffer) {
+        return {
+          tone: "bullish",
+          title: "BULLISH VIEW CONTINUE",
+          subtitle: `PCR holding above recent trough (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
+          trail: formatTroughToLatestTrail(trough, latest),
+          latest,
+          slope,
+          windowLabel: label
+        };
+      }
+
       return {
-        tone: "neutral",
-        title: "NEUTRAL",
-        subtitle: `No strong direction (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
-        trail: formatPcrTrail(oldestToLatest),
+        tone: "bearish",
+        title: "BEARISH VIEW CONTINUE",
+        subtitle: `PCR holding below recent peak (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
+        trail: formatPeakToLatestTrail(peak, latest),
         latest,
         slope,
         windowLabel: label
@@ -448,6 +428,7 @@ export default function PcrTableClient({
     if (!orderedRows.length || !pcrTrendViews) return null;
     const latestRow = orderedRows[0];
     const latestAllPcr = toNumeric(latestRow[TREND_SOURCE]);
+    const latestFastPcr = toNumeric(latestRow["Current Change OI PCR"]);
     const peChg = parseCompactVolume(latestRow["PE OI Change (±2)"]) ?? 0;
     const ceChg = parseCompactVolume(latestRow["CE OI Change (±2)"]) ?? 0;
     const oiDiff = peChg - ceChg;
@@ -525,8 +506,13 @@ export default function PcrTableClient({
 
     const direction: "BULLISH" | "BEARISH" | "NO TRADE" =
       score >= 62 ? "BULLISH" : score <= 38 ? "BEARISH" : "NO TRADE";
+    const fastTriggerAligned =
+      latestFastPcr !== null &&
+      ((direction === "BULLISH" && latestFastPcr >= 1.1) ||
+        (direction === "BEARISH" && latestFastPcr <= 0.9));
     const entryReady =
       direction !== "NO TRADE" &&
+      fastTriggerAligned &&
       regime !== "Volatile/Choppy" &&
       ((direction === "BULLISH" && trend3.tone === "bullish") ||
         (direction === "BEARISH" && trend3.tone === "bearish"));
@@ -571,6 +557,41 @@ export default function PcrTableClient({
       hedgeStrike: number;
       safety: "LOW" | "MEDIUM" | "HIGH";
     } | null = null;
+    let itmCalendarPlan: {
+      spot: number;
+      direction: "BULLISH" | "BEARISH";
+      strategy: "ITM CE CALENDAR" | "ITM PE CALENDAR";
+      strike: number;
+      optionType: "CE" | "PE";
+      sellLeg: string;
+      buyLeg: string;
+    } | null = null;
+
+    if (underlying !== null) {
+      if (direction === "BULLISH") {
+        const strike = roundDownToStep(underlying - ITM_CALENDAR_OFFSET_POINTS, DEFAULT_STRIKE_STEP);
+        itmCalendarPlan = {
+          spot: Math.round(underlying),
+          direction,
+          strategy: "ITM CE CALENDAR",
+          strike,
+          optionType: "CE",
+          sellLeg: `Sell CE ${strike} (Current Week)`,
+          buyLeg: `Buy CE ${strike} (Next Week)`
+        };
+      } else if (direction === "BEARISH") {
+        const strike = roundUpToStep(underlying + ITM_CALENDAR_OFFSET_POINTS, DEFAULT_STRIKE_STEP);
+        itmCalendarPlan = {
+          spot: Math.round(underlying),
+          direction,
+          strategy: "ITM PE CALENDAR",
+          strike,
+          optionType: "PE",
+          sellLeg: `Sell PE ${strike} (Current Week)`,
+          buyLeg: `Buy PE ${strike} (Next Week)`
+        };
+      }
+    }
 
     if (confirmed && underlying !== null) {
       if (direction === "BULLISH") {
@@ -616,6 +637,7 @@ export default function PcrTableClient({
       sessionName: session.name,
       oiSummary: `${formatVolume(peChg)} vs ${formatVolume(ceChg)}`,
       sellStrikePlan,
+      itmCalendarPlan,
       entryWindowStatus,
       entryWindowReason
     };
@@ -790,34 +812,70 @@ export default function PcrTableClient({
             <div className="intel-head">
               <span>Suggested Selling Strike</span>
             </div>
-            {analyticsView.sellStrikePlan ? (
+            {analyticsView.sellStrikePlan || analyticsView.itmCalendarPlan ? (
               <div className="strike-plan">
                 <div className="row">
                   <small>Strategy</small>
-                  <b>{analyticsView.sellStrikePlan.strategy}</b>
+                  <b>
+                    {analyticsView.sellStrikePlan
+                      ? analyticsView.sellStrikePlan.strategy
+                      : analyticsView.itmCalendarPlan?.strategy}
+                  </b>
                 </div>
-                <div className="row">
-                  <b>{analyticsView.sellStrikePlan.side}</b>
-                  <span>{analyticsView.sellStrikePlan.strike}</span>
-                </div>
-                <div className="row">
-                  <small>{analyticsView.sellStrikePlan.hedgeSide}</small>
-                  <span>{analyticsView.sellStrikePlan.hedgeStrike}</span>
-                </div>
-                <div className="row">
-                  <small>Relative Safety</small>
-                  <span
-                    className={`safe-pill ${
-                      analyticsView.sellStrikePlan.safety === "HIGH"
-                        ? "high"
-                        : analyticsView.sellStrikePlan.safety === "MEDIUM"
-                          ? "medium"
-                          : "low"
-                    }`}
-                  >
-                    {analyticsView.sellStrikePlan.safety}
-                  </span>
-                </div>
+                {analyticsView.sellStrikePlan && (
+                  <>
+                    <div className="row">
+                      <b>{analyticsView.sellStrikePlan.side}</b>
+                      <span>{analyticsView.sellStrikePlan.strike}</span>
+                    </div>
+                    <div className="row">
+                      <small>{analyticsView.sellStrikePlan.hedgeSide}</small>
+                      <span>{analyticsView.sellStrikePlan.hedgeStrike}</span>
+                    </div>
+                    <div className="row">
+                      <small>Relative Safety</small>
+                      <span
+                        className={`safe-pill ${
+                          analyticsView.sellStrikePlan.safety === "HIGH"
+                            ? "high"
+                            : analyticsView.sellStrikePlan.safety === "MEDIUM"
+                              ? "medium"
+                              : "low"
+                        }`}
+                      >
+                        {analyticsView.sellStrikePlan.safety}
+                      </span>
+                    </div>
+                  </>
+                )}
+                {analyticsView.itmCalendarPlan && (
+                  <>
+                    <div className="row">
+                      <small>ITM Calendar Spot</small>
+                      <span>{analyticsView.itmCalendarPlan.spot}</span>
+                    </div>
+                    <div className="row">
+                      <small>Direction</small>
+                      <b>{analyticsView.itmCalendarPlan.direction}</b>
+                    </div>
+                    <div className="row">
+                      <small>Strategy</small>
+                      <b>{analyticsView.itmCalendarPlan.strategy}</b>
+                    </div>
+                    <div className="row">
+                      <small>Strike</small>
+                      <b>{analyticsView.itmCalendarPlan.strike}</b>
+                    </div>
+                    <div className="row">
+                      <small>Sell Leg</small>
+                      <span>{analyticsView.itmCalendarPlan.sellLeg}</span>
+                    </div>
+                    <div className="row">
+                      <small>Buy Leg</small>
+                      <span>{analyticsView.itmCalendarPlan.buyLeg}</span>
+                    </div>
+                  </>
+                )}
                 <p className="disclaimer">
                   For intraday guidance only. Re-check if trend flips or score weakens.
                 </p>
