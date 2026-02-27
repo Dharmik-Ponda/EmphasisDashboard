@@ -60,6 +60,7 @@ const headers = [
   "Current Change OI PCR",
   "Current All OI PCR"
 ];
+const pcrHeaders = headers.filter((header) => header.includes("PCR"));
 
 const formatVolume = (value: number) => {
   if (!Number.isFinite(value)) return "-";
@@ -85,12 +86,11 @@ const toNumeric = (value: unknown) => {
   return null;
 };
 
-const formatPcrTrail = (values: number[]) => values.map((v) => `|${v.toFixed(2)}|`).join(" ");
 const formatPeakToLatestTrail = (peak: number, latest: number) =>
   `|${peak.toFixed(2)}| -> |${latest.toFixed(2)}|`;
 const formatTroughToLatestTrail = (trough: number, latest: number) =>
   `|${trough.toFixed(2)}| -> |${latest.toFixed(2)}|`;
-const TREND_LOOKBACK_POINTS = 10;
+const REVERSAL_THRESHOLD = 0.1;
 const MAX_ROWS = 5;
 const HISTORY_MAX_ROWS = 10000;
 const THREE_MIN_MS = 3 * 60 * 1000;
@@ -176,6 +176,117 @@ const getIstSessionPhase = () => {
 
 const roundDownToStep = (value: number, step: number) => Math.floor(value / step) * step;
 const roundUpToStep = (value: number, step: number) => Math.ceil(value / step) * step;
+const getPcrZone = (value: number): Tone => {
+  if (value > 1.25) return "bullish";
+  if (value < 0.75) return "bearish";
+  return "neutral";
+};
+
+type EngineState = "BULLISH_VIEW_CONTINUE" | "BEARISH_VIEW_CONTINUE" | "BULLISH_RISK" | "BEARISH_RISK" | "NEUTRAL";
+
+const evaluatePcrEngine = (
+  values: number[],
+  strike: number | null
+): {
+  tone: Tone;
+  title: string;
+  subtitle: string;
+  trail: string;
+  latest: number;
+  slope: number;
+} => {
+  const latest = values[values.length - 1];
+  const oldest = values[0];
+  const slope = latest - oldest;
+  const latestZone = getPcrZone(latest);
+
+  if (latestZone === "neutral") {
+    return {
+      tone: "neutral",
+      title: "NEUTRAL",
+      subtitle: `Slope too small${strike ? ` · Strike ${strike}` : ""}`,
+      trail: formatPeakToLatestTrail(latest, latest),
+      latest,
+      slope
+    };
+  }
+
+  let peak: number | null = null;
+  let base: number | null = null;
+  let lastBullPeak: number | null = null;
+  let lastBearBase: number | null = null;
+  let activeZone: Tone | null = null;
+
+  for (const value of values) {
+    const zone = getPcrZone(value);
+
+    if (zone === "bullish") {
+      if (activeZone !== "bullish" || peak === null) {
+        peak = value;
+      } else if (value >= peak + REVERSAL_THRESHOLD) {
+        peak = value;
+      }
+      lastBullPeak = peak;
+      activeZone = "bullish";
+      continue;
+    }
+
+    if (zone === "bearish") {
+      if (activeZone !== "bearish" || base === null) {
+        base = value;
+      } else if (value <= base - REVERSAL_THRESHOLD) {
+        base = value;
+      }
+      lastBearBase = base;
+      activeZone = "bearish";
+      continue;
+    }
+
+    activeZone = "neutral";
+  }
+
+  if (latestZone === "bullish") {
+    const resolvedPeak = lastBullPeak ?? latest;
+    const dropFromPeak = resolvedPeak - latest;
+    const state: EngineState =
+      dropFromPeak >= REVERSAL_THRESHOLD ? "BEARISH_RISK" : "BULLISH_VIEW_CONTINUE";
+    return {
+      tone: state === "BEARISH_RISK" ? "bearish" : "bullish",
+      title: state === "BEARISH_RISK" ? "BEARISH RISK" : "BULLISH VIEW CONTINUE",
+      subtitle:
+        state === "BEARISH_RISK"
+          ? `PCR pulled back from bullish peak (peak drop ${dropFromPeak.toFixed(2)})${
+              strike ? ` · Strike ${strike}` : ""
+            }`
+          : `PCR remains in bullish zone (peak drop ${dropFromPeak.toFixed(2)})${
+              strike ? ` · Strike ${strike}` : ""
+            }`,
+      trail: formatPeakToLatestTrail(resolvedPeak, latest),
+      latest,
+      slope
+    };
+  }
+
+  const resolvedBase = lastBearBase ?? latest;
+  const riseFromBase = latest - resolvedBase;
+  const state: EngineState =
+    riseFromBase >= REVERSAL_THRESHOLD ? "BULLISH_RISK" : "BEARISH_VIEW_CONTINUE";
+  return {
+    tone: state === "BULLISH_RISK" ? "bullish" : "bearish",
+    title: state === "BULLISH_RISK" ? "BULLISH RISK" : "BEARISH VIEW CONTINUE",
+    subtitle:
+      state === "BULLISH_RISK"
+        ? `PCR bouncing from bearish base (trough rise ${riseFromBase.toFixed(2)})${
+            strike ? ` · Strike ${strike}` : ""
+          }`
+        : `PCR remains in bearish zone (trough rise ${riseFromBase.toFixed(2)})${
+            strike ? ` · Strike ${strike}` : ""
+          }`,
+    trail: formatTroughToLatestTrail(resolvedBase, latest),
+    latest,
+    slope
+  };
+};
 
 export default function PcrTableClient({
   instrumentKey,
@@ -259,134 +370,52 @@ export default function PcrTableClient({
     return historyRows.slice(-MAX_ROWS).map((item) => item.row).reverse();
   }, [historyRows]);
 
+  const pcrExtremes = useMemo(() => {
+    const extremes: Record<string, { high: number | null; low: number | null }> = {};
+    for (const header of pcrHeaders) {
+      extremes[header] = { high: null, low: null };
+    }
+
+    for (const item of historyRows) {
+      for (const header of pcrHeaders) {
+        const value = toNumeric(item.row[header]);
+        if (value === null) continue;
+        const current = extremes[header];
+        current.high = current.high === null ? value : Math.max(current.high, value);
+        current.low = current.low === null ? value : Math.min(current.low, value);
+      }
+    }
+
+    return extremes;
+  }, [historyRows]);
+
   const pcrTrendViews = useMemo((): { trend3m: TrendView; trend5m: TrendView } | null => {
     if (!historyRows.length) return null;
 
     const strike = data?.signals?.buildUpStrike ?? null;
     const buildTrendView = (series: PcrSamplePoint[], label: "3m" | "5m"): TrendView => {
       if (series.length < 2) {
+        const latest = series[series.length - 1]?.value ?? null;
         return {
           tone: "neutral",
           title: `${label.toUpperCase()} TREND PENDING`,
-          subtitle: `Need at least 2 samples from ${label.toUpperCase()} PCR array`,
-          trail: formatPcrTrail(series.map((point) => point.value).slice(-5)),
-          latest: series[series.length - 1]?.value ?? null,
+          subtitle: "Need at least 2 PCR samples",
+          trail: latest === null ? "" : formatPeakToLatestTrail(latest, latest),
+          latest,
           slope: 0,
           windowLabel: label
         };
       }
 
-      const oldestToLatest = series
-        .slice(-TREND_LOOKBACK_POINTS)
-        .map((point) => point.value);
-
-      const latest = oldestToLatest[oldestToLatest.length - 1];
-      const oldest = oldestToLatest[0];
-      const slope = latest - oldest;
-      const peak = Math.max(...oldestToLatest);
-      const dropFromPeak = peak - latest;
-      const trough = Math.min(...oldestToLatest);
-      const riseFromTrough = latest - trough;
-      const reversalThreshold = 0.1;
-      const neutralSlopeBuffer = 0.06;
-
-      if (latest <= 0.75) {
-        if (riseFromTrough >= reversalThreshold) {
-          return {
-            tone: "bullish",
-            title: "BULLISH RISK",
-            subtitle: `PCR reversing up from bearish zone (${label} array, trough rise ${riseFromTrough.toFixed(
-              2
-            )})${strike ? ` · Strike ${strike}` : ""}`,
-            trail: formatTroughToLatestTrail(trough, latest),
-            latest,
-            slope,
-            windowLabel: label
-          };
-        }
-        return {
-          tone: "bearish",
-          title: "BEARISH VIEW CONTINUE",
-          subtitle: `PCR remains in bearish zone (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
-          trail: formatTroughToLatestTrail(trough, latest),
-          latest,
-          slope,
-          windowLabel: label
-        };
-      }
-
-      if (latest >= 1.25) {
-        if (dropFromPeak >= reversalThreshold) {
-          return {
-            tone: "bearish",
-            title: "BEARISH RISK",
-            subtitle: `PCR falling from bullish zone (${label} array, peak drop ${dropFromPeak.toFixed(2)})${
-              strike ? ` · Strike ${strike}` : ""
-            }`,
-            trail: formatPeakToLatestTrail(peak, latest),
-            latest,
-            slope,
-            windowLabel: label
-          };
-        }
-        return {
-          tone: "bullish",
-          title: "BULLISH VIEW CONTINUE",
-          subtitle: `PCR remains in bullish zone (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
-          trail: formatPeakToLatestTrail(peak, latest),
-          latest,
-          slope,
-          windowLabel: label
-        };
-      }
-
-      if (dropFromPeak >= reversalThreshold && dropFromPeak >= riseFromTrough) {
-        return {
-          tone: "bearish",
-          title: "BEARISH RISK",
-          subtitle: `PCR pullback from recent peak (${label} array, peak drop ${dropFromPeak.toFixed(2)})${
-            strike ? ` · Strike ${strike}` : ""
-          }`,
-          trail: formatPeakToLatestTrail(peak, latest),
-          latest,
-          slope,
-          windowLabel: label
-        };
-      }
-
-      if (riseFromTrough >= reversalThreshold && riseFromTrough > dropFromPeak) {
-        return {
-          tone: "bullish",
-          title: "BULLISH RISK",
-          subtitle: `PCR bounce from recent trough (${label} array, trough rise ${riseFromTrough.toFixed(2)})${
-            strike ? ` · Strike ${strike}` : ""
-          }`,
-          trail: formatTroughToLatestTrail(trough, latest),
-          latest,
-          slope,
-          windowLabel: label
-        };
-      }
-
-      if (slope >= -neutralSlopeBuffer) {
-        return {
-          tone: "bullish",
-          title: "BULLISH VIEW CONTINUE",
-          subtitle: `PCR holding above recent trough (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
-          trail: formatTroughToLatestTrail(trough, latest),
-          latest,
-          slope,
-          windowLabel: label
-        };
-      }
-
+      const oldestToLatest = series.map((point) => point.value);
+      const engine = evaluatePcrEngine(oldestToLatest, strike);
       return {
-        tone: "bearish",
-        title: "BEARISH VIEW CONTINUE",
-        subtitle: `PCR holding below recent peak (${label} array)${strike ? ` · Strike ${strike}` : ""}`,
-        trail: formatPeakToLatestTrail(peak, latest),
-        latest,
-        slope,
+        tone: engine.tone,
+        title: engine.title,
+        subtitle: engine.subtitle,
+        trail: engine.trail,
+        latest: engine.latest,
+        slope: engine.slope,
         windowLabel: label
       };
     };
@@ -893,7 +922,20 @@ export default function PcrTableClient({
           <thead>
             <tr>
               {headers.map((h) => (
-                <th key={h}>{h}</th>
+                <th key={h} className={h.includes("PCR") ? "pcr-col" : undefined}>
+                  <span className="pcr-head-label">{h}</span>
+                  {h.includes("PCR") && (
+                    <span className="pcr-extremes">
+                      <span className="pcr-badge high">
+                        H: {pcrExtremes[h]?.high?.toFixed(2) ?? "-"}
+                      </span>
+                      <span className="pcr-sep">|</span>
+                      <span className="pcr-badge low">
+                        L: {pcrExtremes[h]?.low?.toFixed(2) ?? "-"}
+                      </span>
+                    </span>
+                  )}
+                </th>
               ))}
             </tr>
           </thead>
@@ -907,7 +949,7 @@ export default function PcrTableClient({
               return (
                 <tr key={rowKey} className={rowClass}>
                 {headers.map((h) => (
-                  <td key={h}>
+                  <td key={h} className={h.includes("PCR") ? "pcr-col" : undefined}>
                     {typeof row[h] === "number" && !isRatioColumn(h)
                       ? formatVolume(row[h] as number)
                       : row[h] ?? "-"}

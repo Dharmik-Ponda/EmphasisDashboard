@@ -1646,6 +1646,54 @@ body {
   border-bottom: 1px solid #e2e8f0;
 }
 
+.pcr table.chain th .pcr-extremes {
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.pcr table.chain th .pcr-head-label {
+  display: block;
+}
+
+.pcr table.chain th.pcr-col,
+.pcr table.chain td.pcr-col {
+  text-align: right;
+}
+
+.pcr table.chain th.pcr-col .pcr-extremes {
+  justify-content: flex-end;
+}
+
+.pcr table.chain th .pcr-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  line-height: 1.25;
+}
+
+.pcr table.chain th .pcr-badge.high {
+  color: #166534;
+  background: #ecfdf3;
+  border-color: #bbf7d0;
+}
+
+.pcr table.chain th .pcr-badge.low {
+  color: #9f1239;
+  background: #fff1f2;
+  border-color: #fecdd3;
+}
+
+.pcr table.chain th .pcr-sep {
+  color: #64748b;
+  font-weight: 800;
+}
+
 .pcr table.chain td,
 .pcr table.chain th {
   padding: 4px 8px;
