@@ -198,91 +198,37 @@ const evaluatePcrEngine = (
   const latest = values[values.length - 1];
   const oldest = values[0];
   const slope = latest - oldest;
-  const latestZone = getPcrZone(latest);
+  const lastStep = values.length >= 2 ? values[values.length - 1] - values[values.length - 2] : 0;
+  const directionalSlope = Math.abs(slope) >= 0.01 ? slope : lastStep;
+  const bullishBias = directionalSlope === 0 ? latest >= oldest : directionalSlope > 0;
+  const windowPeak = values.reduce((max, value) => Math.max(max, value), values[0]);
+  const windowBase = values.reduce((min, value) => Math.min(min, value), values[0]);
+  const directionalMove = bullishBias ? latest - windowBase : windowPeak - latest;
+  const state: EngineState = bullishBias
+    ? directionalMove > REVERSAL_THRESHOLD
+      ? "BULLISH_VIEW_CONTINUE"
+      : "BULLISH_RISK"
+    : directionalMove > REVERSAL_THRESHOLD
+      ? "BEARISH_VIEW_CONTINUE"
+      : "BEARISH_RISK";
 
-  if (latestZone === "neutral") {
-    return {
-      tone: "neutral",
-      title: "NEUTRAL",
-      subtitle: `Slope too small${strike ? ` · Strike ${strike}` : ""}`,
-      trail: formatPeakToLatestTrail(latest, latest),
-      latest,
-      slope
-    };
-  }
-
-  let peak: number | null = null;
-  let base: number | null = null;
-  let lastBullPeak: number | null = null;
-  let lastBearBase: number | null = null;
-  let activeZone: Tone | null = null;
-
-  for (const value of values) {
-    const zone = getPcrZone(value);
-
-    if (zone === "bullish") {
-      if (activeZone !== "bullish" || peak === null) {
-        peak = value;
-      } else if (value >= peak + REVERSAL_THRESHOLD) {
-        peak = value;
-      }
-      lastBullPeak = peak;
-      activeZone = "bullish";
-      continue;
-    }
-
-    if (zone === "bearish") {
-      if (activeZone !== "bearish" || base === null) {
-        base = value;
-      } else if (value <= base - REVERSAL_THRESHOLD) {
-        base = value;
-      }
-      lastBearBase = base;
-      activeZone = "bearish";
-      continue;
-    }
-
-    activeZone = "neutral";
-  }
-
-  if (latestZone === "bullish") {
-    const resolvedPeak = lastBullPeak ?? latest;
-    const dropFromPeak = resolvedPeak - latest;
-    const state: EngineState =
-      dropFromPeak >= REVERSAL_THRESHOLD ? "BEARISH_RISK" : "BULLISH_VIEW_CONTINUE";
-    return {
-      tone: state === "BEARISH_RISK" ? "bearish" : "bullish",
-      title: state === "BEARISH_RISK" ? "BEARISH RISK" : "BULLISH VIEW CONTINUE",
-      subtitle:
-        state === "BEARISH_RISK"
-          ? `PCR pulled back from bullish peak (peak drop ${dropFromPeak.toFixed(2)})${
-              strike ? ` · Strike ${strike}` : ""
-            }`
-          : `PCR remains in bullish zone (peak drop ${dropFromPeak.toFixed(2)})${
-              strike ? ` · Strike ${strike}` : ""
-            }`,
-      trail: formatPeakToLatestTrail(resolvedPeak, latest),
-      latest,
-      slope
-    };
-  }
-
-  const resolvedBase = lastBearBase ?? latest;
-  const riseFromBase = latest - resolvedBase;
-  const state: EngineState =
-    riseFromBase >= REVERSAL_THRESHOLD ? "BULLISH_RISK" : "BEARISH_VIEW_CONTINUE";
   return {
-    tone: state === "BULLISH_RISK" ? "bullish" : "bearish",
-    title: state === "BULLISH_RISK" ? "BULLISH RISK" : "BEARISH VIEW CONTINUE",
+    tone: bullishBias ? "bullish" : "bearish",
+    title:
+      state === "BULLISH_VIEW_CONTINUE"
+        ? "BULLISH VIEW CONTINUE"
+        : state === "BEARISH_VIEW_CONTINUE"
+          ? "BEARISH VIEW CONTINUE"
+          : state === "BULLISH_RISK"
+            ? "BULLISH RISK"
+            : "BEARISH RISK",
     subtitle:
-      state === "BULLISH_RISK"
-        ? `PCR bouncing from bearish base (trough rise ${riseFromBase.toFixed(2)})${
-            strike ? ` · Strike ${strike}` : ""
-          }`
-        : `PCR remains in bearish zone (trough rise ${riseFromBase.toFixed(2)})${
-            strike ? ` · Strike ${strike}` : ""
-          }`,
-    trail: formatTroughToLatestTrail(resolvedBase, latest),
+      `${bullishBias ? "Base-to-latest" : "Peak-to-latest"} move ${directionalMove.toFixed(2)}${
+        strike ? ` · Strike ${strike}` : ""
+      }`,
+    trail: bullishBias
+      ? formatTroughToLatestTrail(windowBase, latest)
+      : formatPeakToLatestTrail(windowPeak, latest),
     latest,
     slope
   };
