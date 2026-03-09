@@ -2,13 +2,14 @@ import OptionChainClient from "./OptionChainClient";
 import PcrTableClient from "../../PcrTableClient";
 import { headers } from "next/headers";
 
-async function getOptionChain() {
+async function getOptionChain(instrumentKey: string) {
   try {
     const h = await headers();
     const host = h.get("x-forwarded-host") || h.get("host");
     const proto = h.get("x-forwarded-proto") || "https";
     const baseUrl = process.env.NEXTAUTH_URL || (host ? `${proto}://${host}` : "http://localhost:5000");
     const url = new URL("/api/nifty/option-chain", baseUrl);
+    url.searchParams.set("instrument_key", instrumentKey);
     url.searchParams.set("include_history", "1");
     const res = await fetch(url.toString(), {
       cache: "no-store"
@@ -24,7 +25,8 @@ async function getOptionChain() {
 }
 
 export default async function NiftyOptionChainPage() {
-  const data = await getOptionChain();
+  const niftyKey = "NSE_INDEX|Nifty 50";
+  const data = await getOptionChain(niftyKey);
   if ("error" in data) {
     return (
       <main className="page">
@@ -46,9 +48,9 @@ export default async function NiftyOptionChainPage() {
   }
   return (
     <main className="page">
-      <PcrTableClient title="Nifty Live PCR" />
+      <PcrTableClient title="Nifty Live PCR" instrumentKey={niftyKey} />
       <div className="section-divider" />
-      <OptionChainClient initialData={data} symbol="NIFTY 50" />
+      <OptionChainClient initialData={data} symbol="NIFTY 50" instrumentKey={niftyKey} />
     </main>
   );
 }

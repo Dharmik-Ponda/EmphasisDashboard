@@ -19,7 +19,8 @@ type OptionChainRow = {
   put_options?: { market_data?: Record<string, unknown> } | Record<string, unknown>;
 };
 
-let lastFiveRecords: any[] = [];
+const MAX_PCR_RECORDS = 2000;
+let pcrRecords: any[] = [];
 const DEDUPE_FIELDS = [
   "PE Total OI Change",
   "CE Total OI Change",
@@ -408,16 +409,18 @@ export async function GET(req: Request) {
     "Current All OI PCR": +current_all_pcr.toFixed(2)
   };
 
-  const isDuplicate = lastFiveRecords.some((existing) =>
+  const isDuplicate = pcrRecords.some((existing) =>
     DEDUPE_FIELDS.every((field) => existing?.[field] === record[field])
   );
   if (!isDuplicate) {
-    lastFiveRecords.push(record);
-    if (lastFiveRecords.length > 5) lastFiveRecords.shift();
+    pcrRecords.push(record);
+    if (pcrRecords.length > MAX_PCR_RECORDS) {
+      pcrRecords = pcrRecords.slice(-MAX_PCR_RECORDS);
+    }
   }
 
     return NextResponse.json({
-      records: lastFiveRecords,
+      records: pcrRecords,
       latest: record,
       expiry: expiryDate,
       underlying,

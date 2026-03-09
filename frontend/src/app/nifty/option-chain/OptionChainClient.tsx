@@ -101,8 +101,6 @@ export default function OptionChainClient({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeExpiry, setActiveExpiry] = useState<string>(initialData.expiry);
-  const ltpKeys = `${instrumentKey || "NSE_INDEX|Nifty 50"},${vixKey}`;
-  const [lastLtpAt, setLastLtpAt] = useState(0);
   const prevChainData = useRef<any[]>([]);
   const prevDifferentOiChg = useRef<
     Record<string, { call?: number | null; put?: number | null }>
@@ -185,46 +183,11 @@ export default function OptionChainClient({
     }
   };
 
-  const loadLtp = async () => {
-    const now = Date.now();
-    if (now - lastLtpAt < 10000) return; // throttle to 10s
-    try {
-      const res = await fetch(`/api/upstox/ltp?keys=${encodeURIComponent(ltpKeys)}`, {
-        cache: "no-store"
-      });
-      if (!res.ok) return;
-      const json = await res.json();
-      const dataObj = json?.data?.data || {};
-      const pick = (token: string) => {
-        const alt = token.replace("|", ":");
-        const byKey = dataObj[token] || dataObj[alt];
-        if (byKey?.last_price) return byKey.last_price as number;
-        const byToken = Object.values(dataObj).find(
-          (v: any) => v?.instrument_token === token || v?.instrument_token === alt
-        ) as any;
-        return byToken?.last_price ?? null;
-      };
-      const underlying = pick(instrumentKey || "NSE_INDEX|Nifty 50");
-      const vix = pick(vixKey);
-      if (underlying !== null || vix !== null) {
-        setData((prev) => ({
-          ...prev,
-          underlying: underlying ?? prev.underlying,
-          vix: vix ?? prev.vix
-        }));
-      }
-      setLastLtpAt(now);
-    } catch {
-      // ignore
-    }
-  };
-
   useEffect(() => {
     prevChainData.current = initialData.chain;
     prevDifferentOiChg.current = {};
     setData(initialData);
     setActiveExpiry(initialData.expiry);
-    loadLtp();
   }, [initialData]);
 
   useEffect(() => {
@@ -352,11 +315,6 @@ export default function OptionChainClient({
     };
   }, [activeExpiry, instrumentKey, oiChangeThresholdRatio]);
 
-  useEffect(() => {
-    const id = setInterval(loadLtp, 10000);
-    return () => clearInterval(id);
-  }, [lastLtpAt]);
-
   return (
     <>
       <style>
@@ -381,7 +339,7 @@ export default function OptionChainClient({
           </h1>
           <div className="subtitle">
             <span className="label">Underlying</span>
-            <span className="value">{formatNumber(data.underlying)}</span>
+            <span className="value">{formatNumber(spotPrice)}</span>
             <span className="dot">•</span>
             <span className="label">Step</span>
             <span className="value">{formatNumber(data.step)}</span>

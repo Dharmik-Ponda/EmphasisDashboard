@@ -29,6 +29,10 @@ type PcrSamplePoint = {
   at: number;
   value: number;
 };
+type TrendAnchors = {
+  peak: number;
+  trough: number;
+};
 
 type PcrResponse = {
   records: PcrRecord[];
@@ -90,9 +94,11 @@ const formatPeakToLatestTrail = (peak: number, latest: number) =>
   `|${peak.toFixed(2)}| -> |${latest.toFixed(2)}|`;
 const formatTroughToLatestTrail = (trough: number, latest: number) =>
   `|${trough.toFixed(2)}| -> |${latest.toFixed(2)}|`;
-const REVERSAL_THRESHOLD = 0.1;
+const REVERSAL_THRESHOLD_POINTS = 10;
+const REVERSAL_THRESHOLD_VALUE = REVERSAL_THRESHOLD_POINTS / 100;
 const MAX_ROWS = 5;
-const HISTORY_MAX_ROWS = 10000;
+const HISTORY_MAX_ROWS = 2000;
+const PCR_HISTORY_STORAGE_PREFIX = "pcr-history";
 const THREE_MIN_MS = 3 * 60 * 1000;
 const FIVE_MIN_MS = 5 * 60 * 1000;
 const TREND_SOURCE = "ALL Change OI PCR";
@@ -101,26 +107,56 @@ const DEFAULT_STRIKE_STEP = 50;
 const OTM_OFFSET_POINTS = 250;
 const HEDGE_OFFSET_POINTS = 200;
 const ITM_CALENDAR_OFFSET_POINTS = 100;
-const MAX_PCR_SAMPLES = 600;
 
 const mergeIncomingRows = (previousRows: DisplayRow[], incomingRecords: PcrRecord[]) => {
   if (!incomingRecords.length) return previousRows;
 
   // API records are oldest -> latest; preserve that and only append unseen rows.
-  const incomingOrdered = incomingRecords.slice(-MAX_ROWS);
+  const incomingOrdered = incomingRecords.slice(-HISTORY_MAX_ROWS);
   const previousKeys = new Set(previousRows.map((item) => item.key));
   const merged = [...previousRows];
   const now = Date.now();
   let offsetMs = 0;
 
+  const parseIstTimeToEpoch = (raw: unknown): number | null => {
+    if (typeof raw !== "string") return null;
+    const match = raw.trim().match(/^(\d{1,2}):(\d{2}):(\d{2})\s*(am|pm)$/i);
+    if (!match) return null;
+    let hour = Number(match[1]);
+    const minute = Number(match[2]);
+    const second = Number(match[3]);
+    const meridiem = match[4].toLowerCase();
+    if (meridiem === "pm" && hour !== 12) hour += 12;
+    if (meridiem === "am" && hour === 12) hour = 0;
+
+    const dateParts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Kolkata",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(new Date());
+    const year = dateParts.find((p) => p.type === "year")?.value;
+    const month = dateParts.find((p) => p.type === "month")?.value;
+    const day = dateParts.find((p) => p.type === "day")?.value;
+    if (!year || !month || !day) return null;
+
+    const iso = `${year}-${month}-${day}T${String(hour).padStart(2, "0")}:${String(minute).padStart(
+      2,
+      "0"
+    )}:${String(second).padStart(2, "0")}+05:30`;
+    const parsed = Date.parse(iso);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+
   for (const row of incomingOrdered) {
     const key = buildRowKey(row);
     if (previousKeys.has(key)) continue;
     previousKeys.add(key);
+    const parsedAt = parseIstTimeToEpoch(row.Time);
     merged.push({
       key,
       row,
-      seenAt: now + offsetMs
+      seenAt: parsedAt ?? now + offsetMs
     });
     offsetMs += 1;
   }
@@ -182,11 +218,56 @@ const getPcrZone = (value: number): Tone => {
   return "neutral";
 };
 
+const buildWindowSeries = (
+  rows: DisplayRow[],
+  latestSeenAt: number,
+  windowMs: number
+): PcrSamplePoint[] =>
+  rows
+    .filter((item) => item.seenAt >= latestSeenAt - windowMs)
+    .map((item) => {
+      const value = toNumeric(item.row[TREND_SOURCE]);
+      return value === null ? null : { at: item.seenAt, value };
+    })
+    .filter((point): point is PcrSamplePoint => point !== null);
+
+const getIstDateParts = () => {
+  const dateParts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+  const year = dateParts.find((p) => p.type === "year")?.value;
+  const month = dateParts.find((p) => p.type === "month")?.value;
+  const day = dateParts.find((p) => p.type === "day")?.value;
+  if (!year || !month || !day) return null;
+  return { year, month, day };
+};
+
+const getIstSessionBounds = () => {
+  const parts = getIstDateParts();
+  if (!parts) return null;
+  const start = Date.parse(`${parts.year}-${parts.month}-${parts.day}T09:15:00+05:30`);
+  const end = Date.parse(`${parts.year}-${parts.month}-${parts.day}T15:30:00+05:30`);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return { start, end, dateKey: `${parts.year}-${parts.month}-${parts.day}` };
+};
+
+const sanitizeRowsForSession = (rows: DisplayRow[]) => {
+  const bounds = getIstSessionBounds();
+  if (!bounds) return rows.slice(-HISTORY_MAX_ROWS);
+  return rows
+    .filter((item) => item.seenAt >= bounds.start && item.seenAt <= bounds.end)
+    .slice(-HISTORY_MAX_ROWS);
+};
+
 type EngineState = "BULLISH_VIEW_CONTINUE" | "BEARISH_VIEW_CONTINUE" | "BULLISH_RISK" | "BEARISH_RISK" | "NEUTRAL";
 
 const evaluatePcrEngine = (
   values: number[],
-  strike: number | null
+  strike: number | null,
+  anchors: TrendAnchors | null
 ): {
   tone: Tone;
   title: string;
@@ -194,6 +275,7 @@ const evaluatePcrEngine = (
   trail: string;
   latest: number;
   slope: number;
+  anchors: TrendAnchors;
 } => {
   const latest = values[values.length - 1];
   const oldest = values[0];
@@ -201,14 +283,22 @@ const evaluatePcrEngine = (
   const lastStep = values.length >= 2 ? values[values.length - 1] - values[values.length - 2] : 0;
   const directionalSlope = Math.abs(slope) >= 0.01 ? slope : lastStep;
   const bullishBias = directionalSlope === 0 ? latest >= oldest : directionalSlope > 0;
-  const windowPeak = values.reduce((max, value) => Math.max(max, value), values[0]);
-  const windowBase = values.reduce((min, value) => Math.min(min, value), values[0]);
-  const directionalMove = bullishBias ? latest - windowBase : windowPeak - latest;
+  let trackedPeak = anchors?.peak ?? latest;
+  let trackedTrough = anchors?.trough ?? latest;
+  // Keep anchors monotonic so "peak-to-latest" / "trough-to-latest" moves never flip sign.
+  trackedPeak = Math.max(trackedPeak, latest);
+  trackedTrough = Math.min(trackedTrough, latest);
+  if (latest - trackedPeak >= REVERSAL_THRESHOLD_VALUE) trackedPeak = latest;
+  if (trackedTrough - latest >= REVERSAL_THRESHOLD_VALUE) trackedTrough = latest;
+  const directionalMove = bullishBias
+    ? latest - trackedTrough
+    : trackedPeak - latest;
+  const directionalMovePoints = Math.round(directionalMove * 100);
   const state: EngineState = bullishBias
-    ? directionalMove > REVERSAL_THRESHOLD
+    ? directionalMovePoints >= REVERSAL_THRESHOLD_POINTS
       ? "BULLISH_VIEW_CONTINUE"
       : "BULLISH_RISK"
-    : directionalMove > REVERSAL_THRESHOLD
+    : directionalMovePoints >= REVERSAL_THRESHOLD_POINTS
       ? "BEARISH_VIEW_CONTINUE"
       : "BEARISH_RISK";
 
@@ -223,14 +313,18 @@ const evaluatePcrEngine = (
             ? "BULLISH RISK"
             : "BEARISH RISK",
     subtitle:
-      `${bullishBias ? "Base-to-latest" : "Peak-to-latest"} move ${directionalMove.toFixed(2)}${
+      `${bullishBias ? "Base-to-latest" : "Peak-to-latest"} move ${(directionalMovePoints / 100).toFixed(2)}${
         strike ? ` · Strike ${strike}` : ""
       }`,
     trail: bullishBias
-      ? formatTroughToLatestTrail(windowBase, latest)
-      : formatPeakToLatestTrail(windowPeak, latest),
+      ? formatTroughToLatestTrail(trackedTrough, latest)
+      : formatPeakToLatestTrail(trackedPeak, latest),
     latest,
-    slope
+    slope,
+    anchors: {
+      peak: trackedPeak,
+      trough: trackedTrough
+    }
   };
 };
 
@@ -245,12 +339,12 @@ export default function PcrTableClient({
   const [historyRows, setHistoryRows] = useState<DisplayRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [flashKey, setFlashKey] = useState<string | null>(null);
-  const [pcr3mSeries, setPcr3mSeries] = useState<PcrSamplePoint[]>([]);
-  const [pcr5mSeries, setPcr5mSeries] = useState<PcrSamplePoint[]>([]);
-  const last3mSampleAtRef = useRef<number | null>(null);
-  const last5mSampleAtRef = useRef<number | null>(null);
   const lastTopKeyRef = useRef<string | null>(null);
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const trendAnchorsRef = useRef<{ "3m": TrendAnchors | null; "5m": TrendAnchors | null }>({
+    "3m": null,
+    "5m": null
+  });
 
   const load = async () => {
     try {
@@ -260,12 +354,55 @@ export default function PcrTableClient({
       const next = await res.json();
       if (!res.ok) throw new Error(next?.error || "Failed to load PCR");
       setData(next);
-      setHistoryRows((prev) => mergeIncomingRows(prev, next?.records || []));
+      setHistoryRows((prev) => sanitizeRowsForSession(mergeIncomingRows(prev, next?.records || [])));
       setError(null);
     } catch (e: any) {
       setError(e?.message || "Failed to load PCR");
     }
   };
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const bounds = getIstSessionBounds();
+    if (!bounds) return;
+    const storageKey = `${PCR_HISTORY_STORAGE_PREFIX}:${instrumentKey || "default"}:${bounds.dateKey}`;
+    try {
+      const raw = window.localStorage.getItem(storageKey);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as DisplayRow[];
+      if (!Array.isArray(parsed)) return;
+      const valid = sanitizeRowsForSession(
+        parsed.filter(
+          (item) =>
+            item &&
+            typeof item.key === "string" &&
+            typeof item.seenAt === "number" &&
+            item.row &&
+            typeof item.row === "object"
+        )
+      );
+      if (valid.length) setHistoryRows(valid);
+    } catch {
+      // ignore malformed local cache
+    }
+  }, [instrumentKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const bounds = getIstSessionBounds();
+    if (!bounds) return;
+    const storageKey = `${PCR_HISTORY_STORAGE_PREFIX}:${instrumentKey || "default"}:${bounds.dateKey}`;
+    const rowsToPersist = sanitizeRowsForSession(historyRows);
+    try {
+      if (!rowsToPersist.length) {
+        window.localStorage.removeItem(storageKey);
+      } else {
+        window.localStorage.setItem(storageKey, JSON.stringify(rowsToPersist));
+      }
+    } catch {
+      // ignore localStorage quota / private mode errors
+    }
+  }, [historyRows, instrumentKey]);
 
   useEffect(() => {
     load();
@@ -278,37 +415,6 @@ export default function PcrTableClient({
       if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
     };
   }, []);
-
-  useEffect(() => {
-    if (!historyRows.length) return;
-    const latestItem = historyRows[historyRows.length - 1];
-    const latestPcr = toNumeric(latestItem.row[TREND_SOURCE]);
-    if (latestPcr === null) return;
-
-    const appendSample = (
-      setter: React.Dispatch<React.SetStateAction<PcrSamplePoint[]>>,
-      at: number,
-      value: number
-    ) =>
-      setter((prev) => [...prev, { at, value }].slice(-MAX_PCR_SAMPLES));
-
-    const currentAt = latestItem.seenAt;
-    if (last3mSampleAtRef.current === null) {
-      appendSample(setPcr3mSeries, currentAt, latestPcr);
-      last3mSampleAtRef.current = currentAt;
-    } else if (currentAt - last3mSampleAtRef.current >= THREE_MIN_MS) {
-      appendSample(setPcr3mSeries, currentAt, latestPcr);
-      last3mSampleAtRef.current = currentAt;
-    }
-
-    if (last5mSampleAtRef.current === null) {
-      appendSample(setPcr5mSeries, currentAt, latestPcr);
-      last5mSampleAtRef.current = currentAt;
-    } else if (currentAt - last5mSampleAtRef.current >= FIVE_MIN_MS) {
-      appendSample(setPcr5mSeries, currentAt, latestPcr);
-      last5mSampleAtRef.current = currentAt;
-    }
-  }, [historyRows]);
 
   const orderedRows = useMemo(() => {
     if (!historyRows.length) return [];
@@ -339,8 +445,14 @@ export default function PcrTableClient({
     if (!historyRows.length) return null;
 
     const strike = data?.signals?.buildUpStrike ?? null;
-    const buildTrendView = (series: PcrSamplePoint[], label: "3m" | "5m"): TrendView => {
+    const latestSeenAt = historyRows[historyRows.length - 1]?.seenAt ?? Date.now();
+    const buildTrendView = (windowMs: number, label: "3m" | "5m"): TrendView => {
+      const series = buildWindowSeries(historyRows, latestSeenAt, windowMs);
+
       if (series.length < 2) {
+        trendAnchorsRef.current[label] = series.length === 1
+          ? { peak: series[0].value, trough: series[0].value }
+          : null;
         const latest = series[series.length - 1]?.value ?? null;
         return {
           tone: "neutral",
@@ -354,7 +466,8 @@ export default function PcrTableClient({
       }
 
       const oldestToLatest = series.map((point) => point.value);
-      const engine = evaluatePcrEngine(oldestToLatest, strike);
+      const engine = evaluatePcrEngine(oldestToLatest, strike, trendAnchorsRef.current[label]);
+      trendAnchorsRef.current[label] = engine.anchors;
       return {
         tone: engine.tone,
         title: engine.title,
@@ -367,10 +480,43 @@ export default function PcrTableClient({
     };
 
     return {
-      trend3m: buildTrendView(pcr3mSeries, "3m"),
-      trend5m: buildTrendView(pcr5mSeries, "5m")
+      trend3m: buildTrendView(THREE_MIN_MS, "3m"),
+      trend5m: buildTrendView(FIVE_MIN_MS, "5m")
     };
-  }, [historyRows, data?.signals?.buildUpStrike, pcr3mSeries, pcr5mSeries]);
+  }, [historyRows, data?.signals?.buildUpStrike]);
+
+  useEffect(() => {
+    if (!historyRows.length) return;
+    const latestSeenAt = historyRows[historyRows.length - 1]?.seenAt ?? Date.now();
+    const threeMinute = buildWindowSeries(historyRows, latestSeenAt, THREE_MIN_MS).map((p) => ({
+      at: new Date(p.at).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: true }),
+      value: Number(p.value.toFixed(2))
+    }));
+    const fiveMinute = buildWindowSeries(historyRows, latestSeenAt, FIVE_MIN_MS).map((p) => ({
+      at: new Date(p.at).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: true }),
+      value: Number(p.value.toFixed(2))
+    }));
+    const fullSession = historyRows.map((item) => {
+      const value = toNumeric(item.row[TREND_SOURCE]);
+      return {
+        at: new Date(item.seenAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: true }),
+        value: value === null ? null : Number(value.toFixed(2))
+      };
+    });
+    (window as any).__pcrWindows = { threeMinute, fiveMinute };
+    (window as any).__pcrSession = {
+      totalPoints: fullSession.length,
+      first: fullSession[0] || null,
+      last: fullSession[fullSession.length - 1] || null,
+      values: fullSession
+    };
+    console.debug("__pcrWindows", (window as any).__pcrWindows);
+    console.debug("__pcrSession", {
+      totalPoints: (window as any).__pcrSession.totalPoints,
+      first: (window as any).__pcrSession.first,
+      last: (window as any).__pcrSession.last
+    });
+  }, [historyRows]);
 
   const currentPcrView = useMemo(() => {
     const latest = orderedRows[0];

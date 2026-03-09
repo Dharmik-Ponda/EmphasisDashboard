@@ -12,6 +12,8 @@ const FALLBACK_VIX_KEYS = [
   "NSE_INDEX|INDIA VIX",
   "NSE_INDEX|INDIAVIX"
 ];
+const LTP_CACHE_TTL_MS = 15_000;
+const ltpCache = new Map<string, { value: number; at: number }>();
 
 type OptionChainRow = {
   strike_price?: number;
@@ -111,6 +113,38 @@ function extractLastFromLtpData(data: Record<string, any>, key: string) {
     (v: any) => v?.instrument_token === key || v?.instrument_token === altKey
   ) as any;
   return byKey ?? byToken?.last_price ?? null;
+}
+
+async function resolveLtp(
+  primary: string,
+  fallbacks: string[],
+  token: string
+) {
+  const cacheKey = primary.toLowerCase();
+  const cached = ltpCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && now - cached.at <= LTP_CACHE_TTL_MS) {
+    return { value: cached.value, source: "cache", cacheAgeMs: now - cached.at as number };
+  }
+
+  const keys = [primary, ...fallbacks];
+  const ltpRes = await upstoxLtp(keys, token);
+  const ltpData = ltpRes.ok
+    ? ltpRes.data?.data?.data || ltpRes.data?.data || {}
+    : {};
+
+  for (const key of keys) {
+    const last = extractLastFromLtpData(ltpData, key);
+    if (last !== null) {
+      ltpCache.set(cacheKey, { value: last, at: now });
+      return { value: last, source: `ltp:${key}`, cacheAgeMs: 0 };
+    }
+  }
+
+  if (cached) {
+    return { value: cached.value, source: "stale-cache", cacheAgeMs: now - cached.at };
+  }
+  return { value: null, source: "none", cacheAgeMs: null };
 }
 
 function toDateOnly(value: string) {
@@ -278,16 +312,19 @@ export async function GET(req: Request) {
     step = diffs[Math.floor(diffs.length / 2)] || step;
   }
 
-  const ltpRes = await upstoxLtp([instrumentKey, vixKey], accessToken);
-  const ltpData = ltpRes.ok
-    ? ltpRes.data?.data?.data || ltpRes.data?.data || {}
-    : {};
-  const underlyingFromLtp = extractLastFromLtpData(ltpData, instrumentKey);
-  const vix = extractLastFromLtpData(ltpData, vixKey);
-  const underlyingSpot =
-    underlyingFromLtp ||
+  const [underlyingLtp, vixLtp] = await Promise.all([
+    resolveLtp(instrumentKey, FALLBACK_KEYS, accessToken),
+    resolveLtp(vixKey, FALLBACK_VIX_KEYS, accessToken)
+  ]);
+  const underlyingFromLtp = underlyingLtp.value;
+  const vix = vixLtp.value;
+  const chainSpotRaw =
     (chainRes.data?.data && (chainRes.data?.data as any).underlying_spot_price) ||
     chainRes.data?.underlying_spot_price ||
+    null;
+  const underlyingSpot =
+    underlyingFromLtp ||
+    chainSpotRaw ||
     null;
 
   const atm = underlyingSpot
@@ -347,6 +384,17 @@ export async function GET(req: Request) {
     step,
     window: windowSize,
     chain,
+    spotDebug: {
+      instrumentKey,
+      requestedExpiry: expiryDate,
+      underlyingFromLtp,
+      underlyingLtpSource: underlyingLtp.source,
+      underlyingLtpCacheAgeMs: underlyingLtp.cacheAgeMs,
+      chainUnderlyingSpot: chainSpotRaw,
+      selectedUnderlyingSpot: underlyingSpot,
+      vixFromLtp: vix,
+      vixLtpSource: vixLtp.source
+    },
     priceHistory: priceHistory5m,
     priceHistory5m,
     priceHistory15m
