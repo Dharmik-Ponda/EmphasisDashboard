@@ -231,6 +231,19 @@ const buildWindowSeries = (
     })
     .filter((point): point is PcrSamplePoint => point !== null);
 
+const getSessionAnchors = (rows: DisplayRow[]): TrendAnchors | null => {
+  let peak: number | null = null;
+  let trough: number | null = null;
+  for (const item of rows) {
+    const value = toNumeric(item.row[TREND_SOURCE]);
+    if (value === null) continue;
+    peak = peak === null ? value : Math.max(peak, value);
+    trough = trough === null ? value : Math.min(trough, value);
+  }
+  if (peak === null || trough === null) return null;
+  return { peak, trough };
+};
+
 const getIstDateParts = () => {
   const dateParts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Kolkata",
@@ -267,7 +280,8 @@ type EngineState = "BULLISH_VIEW_CONTINUE" | "BEARISH_VIEW_CONTINUE" | "BULLISH_
 const evaluatePcrEngine = (
   values: number[],
   strike: number | null,
-  anchors: TrendAnchors | null
+  anchors: TrendAnchors | null,
+  sessionAnchors: TrendAnchors | null
 ): {
   tone: Tone;
   title: string;
@@ -290,9 +304,11 @@ const evaluatePcrEngine = (
   trackedTrough = Math.min(trackedTrough, latest);
   if (latest - trackedPeak >= REVERSAL_THRESHOLD_VALUE) trackedPeak = latest;
   if (trackedTrough - latest >= REVERSAL_THRESHOLD_VALUE) trackedTrough = latest;
+  const referencePeak = sessionAnchors?.peak ?? trackedPeak;
+  const referenceTrough = sessionAnchors?.trough ?? trackedTrough;
   const directionalMove = bullishBias
-    ? latest - trackedTrough
-    : trackedPeak - latest;
+    ? latest - referenceTrough
+    : referencePeak - latest;
   const directionalMovePoints = Math.round(directionalMove * 100);
   const state: EngineState = bullishBias
     ? directionalMovePoints >= REVERSAL_THRESHOLD_POINTS
@@ -317,8 +333,8 @@ const evaluatePcrEngine = (
         strike ? ` · Strike ${strike}` : ""
       }`,
     trail: bullishBias
-      ? formatTroughToLatestTrail(trackedTrough, latest)
-      : formatPeakToLatestTrail(trackedPeak, latest),
+      ? formatTroughToLatestTrail(referenceTrough, latest)
+      : formatPeakToLatestTrail(referencePeak, latest),
     latest,
     slope,
     anchors: {
@@ -446,6 +462,7 @@ export default function PcrTableClient({
 
     const strike = data?.signals?.buildUpStrike ?? null;
     const latestSeenAt = historyRows[historyRows.length - 1]?.seenAt ?? Date.now();
+    const sessionAnchors = getSessionAnchors(historyRows);
     const buildTrendView = (windowMs: number, label: "3m" | "5m"): TrendView => {
       const series = buildWindowSeries(historyRows, latestSeenAt, windowMs);
 
@@ -466,7 +483,12 @@ export default function PcrTableClient({
       }
 
       const oldestToLatest = series.map((point) => point.value);
-      const engine = evaluatePcrEngine(oldestToLatest, strike, trendAnchorsRef.current[label]);
+      const engine = evaluatePcrEngine(
+        oldestToLatest,
+        strike,
+        trendAnchorsRef.current[label],
+        sessionAnchors
+      );
       trendAnchorsRef.current[label] = engine.anchors;
       return {
         tone: engine.tone,
