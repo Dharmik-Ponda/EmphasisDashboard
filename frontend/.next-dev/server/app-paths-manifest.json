@@ -1,5 +1,0 @@
-{
-  "/api/nifty/pcr/route": "app/api/nifty/pcr/route.js",
-  "/api/nifty/option-chain/route": "app/api/nifty/option-chain/route.js",
-  "/api/auth/[...nextauth]/route": "app/api/auth/[...nextauth]/route.js"
-}
