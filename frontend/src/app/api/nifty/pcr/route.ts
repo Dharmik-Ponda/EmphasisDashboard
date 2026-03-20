@@ -28,7 +28,11 @@ const DEDUPE_FIELDS = [
   "CE OI Change (±2)",
   "ALL Change OI PCR",
   "Current Change OI PCR",
-  "Current All OI PCR"
+  "Current All OI PCR",
+  "Top OI Increase Strike",
+  "Top OI Increase Value",
+  "Top OI Decrease Strike",
+  "Top OI Decrease Value"
 ] as const;
 
 async function getAccessToken() {
@@ -184,6 +188,16 @@ function trendStrength(changePcr: number) {
   return "STRONG SELLING PRESSURE";
 }
 
+function directionalChangePcr(putChange: number, callChange: number) {
+  const bullishPressure = Math.max(putChange, 0) + Math.max(-callChange, 0);
+  const bearishPressure = Math.max(callChange, 0) + Math.max(-putChange, 0);
+
+  if (bullishPressure === 0 && bearishPressure === 0) return 1;
+  if (bearishPressure === 0) return bullishPressure;
+
+  return bullishPressure / bearishPressure;
+}
+
 function formatVolume(value: number) {
   if (!Number.isFinite(value)) return "0";
   const sign = value < 0 ? "-" : "";
@@ -191,6 +205,36 @@ function formatVolume(value: number) {
   if (abs >= 1e7) return `${sign}${(abs / 1e7).toFixed(2).replace(/\.00$/, "")} Cr`;
   if (abs >= 1e5) return `${sign}${(abs / 1e5).toFixed(2).replace(/\.00$/, "")} L`;
   return `${sign}${Math.round(abs).toLocaleString("en-IN")}`;
+}
+
+function updateTopTwoBuildUps(
+  currentTop: { strike: number | null; oiChange: number },
+  currentSecond: { strike: number | null; oiChange: number },
+  candidateStrike: number,
+  candidateOiChange: number
+) {
+  if (candidateOiChange > currentTop.oiChange) {
+    return {
+      top: { strike: candidateStrike, oiChange: candidateOiChange },
+      second: currentTop
+    };
+  }
+
+  if (candidateOiChange > currentSecond.oiChange) {
+    return {
+      top: currentTop,
+      second: { strike: candidateStrike, oiChange: candidateOiChange }
+    };
+  }
+
+  return {
+    top: currentTop,
+    second: currentSecond
+  };
+}
+
+function formatStrikeWithSide(side: "PE" | "CE", strike: number | null) {
+  return strike === null ? "-" : `${side} ${strike}`;
 }
 
 export async function GET(req: Request) {
@@ -248,7 +292,7 @@ export async function GET(req: Request) {
   const rows = (chainRes.data?.data || []) as OptionChainRow[];
   const sorted = [...rows].sort((a, b) => getStrike(a) - getStrike(b));
 
-  // Determine ATM using underlying LTP, then select ATM ± 2 strikes
+  // Determine ATM using underlying LTP, then select nearby strikes around spot.
   const underlyingRes = await resolveLtpAndVwap(
     instrumentKey,
     FALLBACK_KEYS,
@@ -305,14 +349,18 @@ export async function GET(req: Request) {
 
   let maxPeOiChange = -Infinity;
   let maxPeStrike = null as number | null;
+  let secondPeOiChange = -Infinity;
+  let secondPeStrike = null as number | null;
   let minPeOiChange = Infinity;
   let minPeStrike = null as number | null;
   let maxCeOiChange = -Infinity;
   let maxCeStrike = null as number | null;
+  let secondCeOiChange = -Infinity;
+  let secondCeStrike = null as number | null;
   let minCeOiChange = Infinity;
   let minCeStrike = null as number | null;
 
-  for (const row of sorted) {
+  for (const row of allWindow) {
     const putMarket = getMarket(row.put_options);
     const callMarket = getMarket(row.call_options);
 
@@ -329,18 +377,30 @@ export async function GET(req: Request) {
     ce_oi_lakh_total += callOi;
 
     const strike = getStrike(row);
-    if (putOiChg > maxPeOiChange) {
-      maxPeOiChange = putOiChg;
-      maxPeStrike = strike;
-    }
+    const peBuildUpRanks = updateTopTwoBuildUps(
+      { strike: maxPeStrike, oiChange: maxPeOiChange },
+      { strike: secondPeStrike, oiChange: secondPeOiChange },
+      strike,
+      putOiChg
+    );
+    maxPeStrike = peBuildUpRanks.top.strike;
+    maxPeOiChange = peBuildUpRanks.top.oiChange;
+    secondPeStrike = peBuildUpRanks.second.strike;
+    secondPeOiChange = peBuildUpRanks.second.oiChange;
     if (putOiChg < minPeOiChange) {
       minPeOiChange = putOiChg;
       minPeStrike = strike;
     }
-    if (callOiChg > maxCeOiChange) {
-      maxCeOiChange = callOiChg;
-      maxCeStrike = strike;
-    }
+    const ceBuildUpRanks = updateTopTwoBuildUps(
+      { strike: maxCeStrike, oiChange: maxCeOiChange },
+      { strike: secondCeStrike, oiChange: secondCeOiChange },
+      strike,
+      callOiChg
+    );
+    maxCeStrike = ceBuildUpRanks.top.strike;
+    maxCeOiChange = ceBuildUpRanks.top.oiChange;
+    secondCeStrike = ceBuildUpRanks.second.strike;
+    secondCeOiChange = ceBuildUpRanks.second.oiChange;
     if (callOiChg < minCeOiChange) {
       minCeOiChange = callOiChg;
       minCeStrike = strike;
@@ -368,9 +428,11 @@ export async function GET(req: Request) {
     buyers_volume_count_total += callVol;
   }
 
-  // PCR should be PUT (PE) / CALL (CE)
-  const all_pcr = pe_all_oi_change_total / (ce_all_oi_change_total || 1);
-  const current_change_pcr = pe_oi_change_total / (ce_oi_change_total || 1);
+  // Change-based PCR needs sign-aware handling:
+  // PE build-up and CE unwinding are bullish pressure,
+  // CE build-up and PE unwinding are bearish pressure.
+  const all_pcr = directionalChangePcr(pe_all_oi_change_total, ce_all_oi_change_total);
+  const current_change_pcr = directionalChangePcr(pe_oi_change_total, ce_oi_change_total);
   const current_all_pcr = pe_oi_lakh_total / (ce_oi_lakh_total || 1);
 
   let pcrSignal = "Neutral zone";
@@ -385,15 +447,27 @@ export async function GET(req: Request) {
 
   let buildUpSignal = "Neutral";
   let buildUpStrike: number | null = null;
+  let buildUpSecondaryStrike: number | null = null;
   if (all_pcr > 1.25) {
     buildUpSignal = "Bullish build-up";
     buildUpStrike = maxPeStrike;
+    buildUpSecondaryStrike = secondPeStrike;
   } else if (all_pcr < 0.75) {
     buildUpSignal = "Bearish build-up";
     buildUpStrike = maxCeStrike;
+    buildUpSecondaryStrike = secondCeStrike;
   } else {
     buildUpSignal = "Neutral";
   }
+
+  const topOiIncrease =
+    maxPeOiChange >= maxCeOiChange
+      ? { side: "PE" as const, strike: maxPeStrike, oiChange: maxPeOiChange }
+      : { side: "CE" as const, strike: maxCeStrike, oiChange: maxCeOiChange };
+  const topOiDecrease =
+    minPeOiChange <= minCeOiChange
+      ? { side: "PE" as const, strike: minPeStrike, oiChange: minPeOiChange }
+      : { side: "CE" as const, strike: minCeStrike, oiChange: minCeOiChange };
 
   const record = {
     Time: new Date().toLocaleTimeString("en-IN", {
@@ -406,7 +480,11 @@ export async function GET(req: Request) {
     "CE OI Change (±2)": formatVolume(ce_oi_change_total),
     "ALL Change OI PCR": +all_pcr.toFixed(2),
     "Current Change OI PCR": +current_change_pcr.toFixed(2),
-    "Current All OI PCR": +current_all_pcr.toFixed(2)
+    "Current All OI PCR": +current_all_pcr.toFixed(2),
+    "Top OI Increase Strike": formatStrikeWithSide(topOiIncrease.side, topOiIncrease.strike),
+    "Top OI Increase Value": Number.isFinite(topOiIncrease.oiChange) ? topOiIncrease.oiChange : 0,
+    "Top OI Decrease Strike": formatStrikeWithSide(topOiDecrease.side, topOiDecrease.strike),
+    "Top OI Decrease Value": Number.isFinite(topOiDecrease.oiChange) ? topOiDecrease.oiChange : 0
   };
 
   const isDuplicate = pcrRecords.some((existing) =>
@@ -428,8 +506,10 @@ export async function GET(req: Request) {
       vwap,
       vwapSignal,
       peBuildUp: { strike: maxPeStrike, oiChange: maxPeOiChange },
+      peBuildUpSecondary: { strike: secondPeStrike, oiChange: secondPeOiChange },
       peReduction: { strike: minPeStrike, oiChange: minPeOiChange },
       ceBuildUp: { strike: maxCeStrike, oiChange: maxCeOiChange },
+      ceBuildUpSecondary: { strike: secondCeStrike, oiChange: secondCeOiChange },
       ceReduction: { strike: minCeStrike, oiChange: minCeOiChange },
       sentiment: sentiment(record["ALL Change OI PCR"]),
       trend: trendStrength(record["Current Change OI PCR"]),
@@ -437,7 +517,8 @@ export async function GET(req: Request) {
         pcrSignal,
         pcrTone,
         buildUpSignal,
-        buildUpStrike
+        buildUpStrike,
+        buildUpSecondaryStrike
       }
     });
   } catch (error: any) {

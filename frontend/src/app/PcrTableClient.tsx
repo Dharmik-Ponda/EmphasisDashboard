@@ -9,14 +9,32 @@ type DisplayRow = {
   row: PcrRecord;
 };
 type Tone = "bullish" | "bearish" | "neutral";
-type TrendView = {
+type PcrWindowLabel = "3m" | "5m";
+type PcrAnalysis = {
+  windowLabel: PcrWindowLabel;
+  status: "ready" | "pending";
   tone: Tone;
   title: string;
   subtitle: string;
-  trail: string;
-  latest: number | null;
-  slope: number;
-  windowLabel: "3m" | "5m";
+  updatedAtLabel: string | null;
+  pcr: number | null;
+  previous: number | null;
+  delta: number;
+  pcrDeltaLabel: string;
+  momentum: string;
+  trend: string;
+  regime: string;
+  signal: string;
+  bias: string;
+  score: number;
+  bearScore: number;
+  ma: number | null;
+  mid: number | null;
+  dayLow: number | null;
+  dayHigh: number | null;
+  sampleCount: number;
+  oiIncreaseLabel: string;
+  oiDecreaseLabel: string;
 };
 type JournalEntry = {
   id: string;
@@ -29,9 +47,9 @@ type PcrSamplePoint = {
   at: number;
   value: number;
 };
-type TrendAnchors = {
-  peak: number;
-  trough: number;
+type IntervalSnapshot = {
+  at: number;
+  row: PcrRecord;
 };
 
 type PcrResponse = {
@@ -39,14 +57,17 @@ type PcrResponse = {
   sentiment: { label: string; tone: "bullish" | "bearish" | "neutral" };
   trend: string;
   peBuildUp?: { strike: number | null; oiChange: number };
+  peBuildUpSecondary?: { strike: number | null; oiChange: number };
   peReduction?: { strike: number | null; oiChange: number };
   ceBuildUp?: { strike: number | null; oiChange: number };
+  ceBuildUpSecondary?: { strike: number | null; oiChange: number };
   ceReduction?: { strike: number | null; oiChange: number };
   signals?: {
     pcrSignal: string;
     pcrTone: Tone;
     buildUpSignal: string;
     buildUpStrike?: number | null;
+    buildUpSecondaryStrike?: number | null;
   };
   underlying?: number | null;
   vix?: number | null;
@@ -65,6 +86,13 @@ const headers = [
   "Current All OI PCR"
 ];
 const pcrHeaders = headers.filter((header) => header.includes("PCR"));
+const pcrHeaderSet = new Set(pcrHeaders);
+const signedOiHeaders = new Set([
+  "PE Total OI Change",
+  "CE Total OI Change",
+  "PE OI Change (±2)",
+  "CE OI Change (±2)"
+]);
 
 const formatVolume = (value: number) => {
   if (!Number.isFinite(value)) return "-";
@@ -90,12 +118,21 @@ const toNumeric = (value: unknown) => {
   return null;
 };
 
-const formatPeakToLatestTrail = (peak: number, latest: number) =>
-  `|${peak.toFixed(2)}| -> |${latest.toFixed(2)}|`;
-const formatTroughToLatestTrail = (trough: number, latest: number) =>
-  `|${trough.toFixed(2)}| -> |${latest.toFixed(2)}|`;
-const REVERSAL_THRESHOLD_POINTS = 10;
-const REVERSAL_THRESHOLD_VALUE = REVERSAL_THRESHOLD_POINTS / 100;
+const getPcrValue = (row: PcrRecord, header: string) => {
+  const value = toNumeric(row[header]);
+  if (value === null) return null;
+  return pcrHeaderSet.has(header) ? Math.max(0, value) : value;
+};
+
+const normalizePcrRecord = (row: PcrRecord): PcrRecord => {
+  const normalized: PcrRecord = { ...row };
+  for (const header of pcrHeaders) {
+    const value = getPcrValue(row, header);
+    if (value !== null) normalized[header] = +value.toFixed(2);
+  }
+  return normalized;
+};
+
 const MAX_ROWS = 5;
 const HISTORY_MAX_ROWS = 2000;
 const PCR_HISTORY_STORAGE_PREFIX = "pcr-history";
@@ -107,6 +144,7 @@ const DEFAULT_STRIKE_STEP = 50;
 const OTM_OFFSET_POINTS = 250;
 const HEDGE_OFFSET_POINTS = 200;
 const ITM_CALENDAR_OFFSET_POINTS = 100;
+const PCR_VIEW_FLIP_DELTA = 0.1;
 
 const mergeIncomingRows = (previousRows: DisplayRow[], incomingRecords: PcrRecord[]) => {
   if (!incomingRecords.length) return previousRows;
@@ -149,13 +187,14 @@ const mergeIncomingRows = (previousRows: DisplayRow[], incomingRecords: PcrRecor
   };
 
   for (const row of incomingOrdered) {
-    const key = buildRowKey(row);
+    const normalizedRow = normalizePcrRecord(row);
+    const key = buildRowKey(normalizedRow);
     if (previousKeys.has(key)) continue;
     previousKeys.add(key);
-    const parsedAt = parseIstTimeToEpoch(row.Time);
+    const parsedAt = parseIstTimeToEpoch(normalizedRow.Time);
     merged.push({
       key,
-      row,
+      row: normalizedRow,
       seenAt: parsedAt ?? now + offsetMs
     });
     offsetMs += 1;
@@ -180,6 +219,47 @@ const parseCompactVolume = (value: unknown) => {
   if (unit === "cr") return num * 1e7;
   if (unit === "l") return num * 1e5;
   return num;
+};
+
+const formatSignedDelta = (value: number) => `${value >= 0 ? "+" : ""}${value.toFixed(2)}`;
+
+const buildIntervalSnapshots = (
+  rows: DisplayRow[],
+  intervalMs: number,
+  nowMs: number = Date.now()
+): IntervalSnapshot[] => {
+  const buckets = new Map<number, IntervalSnapshot>();
+  const activeBucketStart = Math.floor(nowMs / intervalMs) * intervalMs;
+
+  for (const item of rows) {
+    const bucketAt = Math.floor(item.seenAt / intervalMs) * intervalMs;
+    if (bucketAt >= activeBucketStart) continue;
+    buckets.set(bucketAt, { at: bucketAt, row: item.row });
+  }
+
+  return Array.from(buckets.entries())
+    .sort((left, right) => left[0] - right[0])
+    .map(([, snapshot]) => snapshot);
+};
+
+const getOiLeaderLabel = (row: PcrRecord, strikeKey: string, valueKey: string) => {
+  const strike = String(row[strikeKey] ?? "-").trim();
+  const rawValue = toNumeric(row[valueKey]);
+  if (!strike || strike === "-") return "-";
+  if (rawValue === null) return strike;
+  return `${strike} (${formatVolume(rawValue)})`;
+};
+
+const getSignedOiCellMeta = (header: string, rawValue: unknown) => {
+  if (!signedOiHeaders.has(header)) return null;
+  const numeric = parseCompactVolume(rawValue);
+  if (numeric === null || numeric === 0) return { className: "", title: `${header}: Flat / no net change` };
+  const side = header.startsWith("PE") ? "PE" : "CE";
+  const action = numeric > 0 ? "Build-up / writing added" : "Unwinding / positions reduced";
+  return {
+    className: numeric < 0 ? "negative" : "",
+    title: `${side}: ${action}`
+  };
 };
 
 const getIstSessionPhase = () => {
@@ -212,36 +292,169 @@ const getIstSessionPhase = () => {
 
 const roundDownToStep = (value: number, step: number) => Math.floor(value / step) * step;
 const roundUpToStep = (value: number, step: number) => Math.ceil(value / step) * step;
-const getPcrZone = (value: number): Tone => {
-  if (value > 1.25) return "bullish";
-  if (value < 0.75) return "bearish";
-  return "neutral";
-};
+const average = (values: number[]) =>
+  values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+const formatBucketTime = (timestamp: number) =>
+  new Date(timestamp).toLocaleTimeString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true
+  });
 
-const buildWindowSeries = (
+const buildIntervalSeries = (
   rows: DisplayRow[],
-  latestSeenAt: number,
-  windowMs: number
-): PcrSamplePoint[] =>
-  rows
-    .filter((item) => item.seenAt >= latestSeenAt - windowMs)
-    .map((item) => {
-      const value = toNumeric(item.row[TREND_SOURCE]);
-      return value === null ? null : { at: item.seenAt, value };
+  intervalMs: number,
+  nowMs: number = Date.now()
+): PcrSamplePoint[] => {
+  return buildIntervalSnapshots(rows, intervalMs, nowMs)
+    .map((snapshot) => {
+      const value = getPcrValue(snapshot.row, TREND_SOURCE);
+      if (value === null) return null;
+      return { at: snapshot.at, value };
     })
     .filter((point): point is PcrSamplePoint => point !== null);
+};
 
-const getSessionAnchors = (rows: DisplayRow[]): TrendAnchors | null => {
-  let peak: number | null = null;
-  let trough: number | null = null;
-  for (const item of rows) {
-    const value = toNumeric(item.row[TREND_SOURCE]);
-    if (value === null) continue;
-    peak = peak === null ? value : Math.max(peak, value);
-    trough = trough === null ? value : Math.min(trough, value);
+const analyzePCR = (
+  series: PcrSamplePoint[],
+  snapshots: IntervalSnapshot[],
+  windowLabel: PcrWindowLabel
+): PcrAnalysis => {
+  const latestSnapshot = snapshots[snapshots.length - 1]?.row ?? null;
+  const oiIncreaseLabel = latestSnapshot
+    ? getOiLeaderLabel(latestSnapshot, "Top OI Increase Strike", "Top OI Increase Value")
+    : "-";
+  const oiDecreaseLabel = latestSnapshot
+    ? getOiLeaderLabel(latestSnapshot, "Top OI Decrease Strike", "Top OI Decrease Value")
+    : "-";
+
+  if (series.length < 2) {
+    const latest = series[series.length - 1]?.value ?? null;
+    return {
+      windowLabel,
+      status: "pending",
+      tone: "neutral",
+      title: `${windowLabel.toUpperCase()} PCR PENDING`,
+      subtitle: "Need at least 2 aggregated PCR samples",
+      updatedAtLabel: series.length ? formatBucketTime(series[series.length - 1].at) : null,
+      pcr: latest,
+      previous: null,
+      delta: 0,
+      pcrDeltaLabel: latest === null ? "-" : `${latest.toFixed(2)} -> ${latest.toFixed(2)} (${formatSignedDelta(0)})`,
+      momentum: "Weak / Neutral Momentum",
+      trend: "Neutral Trend",
+      regime: "Range Pending",
+      signal: "Neutral / Sideways Market",
+      bias: "Wait or use wider spreads",
+      score: 0,
+      bearScore: 0,
+      ma: latest,
+      mid: latest,
+      dayLow: latest,
+      dayHigh: latest,
+      sampleCount: series.length,
+      oiIncreaseLabel,
+      oiDecreaseLabel
+    };
   }
-  if (peak === null || trough === null) return null;
-  return { peak, trough };
+
+  const values = series.map((point) => point.value);
+  const current = values[values.length - 1];
+  const previous = values[values.length - 2];
+  const delta = current - previous;
+  const ma = average(values.slice(-5)) ?? current;
+  const dayLow = Math.min(...values);
+  const dayHigh = Math.max(...values);
+  const mid = (dayLow + dayHigh) / 2;
+
+  const bullishMomentum = delta >= PCR_VIEW_FLIP_DELTA;
+  const bearishMomentum = delta <= -PCR_VIEW_FLIP_DELTA;
+  const aboveMa = current > ma;
+  const belowMa = current < ma;
+  const aboveMid = current > mid;
+  const belowMid = current < mid;
+
+  const momentum = bullishMomentum
+    ? "Bullish Momentum"
+    : bearishMomentum
+      ? "Bearish Momentum"
+      : "Weak / Neutral Momentum";
+  const trend = aboveMa ? "Bullish Trend" : belowMa ? "Bearish Trend" : "Neutral Trend";
+  const regime = aboveMid ? "Upper Range (Bullish Environment)" : "Lower Range (Bearish Environment)";
+
+  const majorBullishShift = bullishMomentum;
+  const majorBearishShift = bearishMomentum;
+  const bullStrength = Number(majorBullishShift) + Number(aboveMa) + Number(aboveMid);
+  const bearStrength = Number(majorBearishShift) + Number(belowMa) + Number(belowMid);
+  const bullContinuationStrength = Number(delta > 0) + Number(aboveMa) + Number(aboveMid);
+  const bearContinuationStrength = Number(delta < 0) + Number(belowMa) + Number(belowMid);
+
+  let signal = "Neutral / Sideways Market";
+  let bias = "Wait or use wider spreads";
+  let tone: Tone = "neutral";
+  let score = 0;
+
+  if (bullStrength === 3 && bearStrength < 3) {
+    signal = "Strong Bullish Pressure";
+    bias = "Prefer Bull Put Spread";
+    tone = "bullish";
+    score = bullStrength;
+  } else if (bearStrength === 3 && bullStrength < 3) {
+    signal = "Strong Bearish Pressure";
+    bias = "Prefer Bear Call Spread";
+    tone = "bearish";
+    score = bearStrength;
+  } else if (bullContinuationStrength >= 2 && bearContinuationStrength < 2) {
+    signal = "Bullish Trend Continuation";
+    bias = "Trend intact, prefer Bull Put Spread on dips";
+    tone = "bullish";
+    score = 2;
+  } else if (bearContinuationStrength >= 2 && bullContinuationStrength < 2) {
+    signal = "Bearish Trend Continuation";
+    bias = "Trend intact, prefer Bear Call Spread on pullbacks";
+    tone = "bearish";
+    score = 2;
+  } else if (bullContinuationStrength === 1 && bearContinuationStrength === 0) {
+    signal = "Bullish Risk";
+    bias = "Bullish setup is weak. Wait for confirmation.";
+    tone = "neutral";
+    score = 1;
+  } else if (bearContinuationStrength === 1 && bullContinuationStrength === 0) {
+    signal = "Bearish Risk";
+    bias = "Bearish setup is weak. Wait for confirmation.";
+    tone = "neutral";
+    score = 1;
+  }
+
+  const bearScore = bearStrength;
+
+  return {
+    windowLabel,
+    status: "ready",
+    tone,
+    title: signal,
+    subtitle: `${momentum} · ${trend}`,
+    updatedAtLabel: formatBucketTime(series[series.length - 1].at),
+    pcr: current,
+    previous,
+    delta,
+    pcrDeltaLabel: `${previous.toFixed(2)} -> ${current.toFixed(2)} (${formatSignedDelta(delta)})`,
+    momentum,
+    trend,
+    regime,
+    signal,
+    bias,
+    score,
+    bearScore,
+    ma,
+    mid,
+    dayLow,
+    dayHigh,
+    sampleCount: series.length,
+    oiIncreaseLabel,
+    oiDecreaseLabel
+  };
 };
 
 const getIstDateParts = () => {
@@ -269,79 +482,15 @@ const getIstSessionBounds = () => {
 
 const sanitizeRowsForSession = (rows: DisplayRow[]) => {
   const bounds = getIstSessionBounds();
-  if (!bounds) return rows.slice(-HISTORY_MAX_ROWS);
+  if (!bounds) {
+    return rows
+      .map((item) => ({ ...item, row: normalizePcrRecord(item.row) }))
+      .slice(-HISTORY_MAX_ROWS);
+  }
   return rows
+    .map((item) => ({ ...item, row: normalizePcrRecord(item.row) }))
     .filter((item) => item.seenAt >= bounds.start && item.seenAt <= bounds.end)
     .slice(-HISTORY_MAX_ROWS);
-};
-
-type EngineState = "BULLISH_VIEW_CONTINUE" | "BEARISH_VIEW_CONTINUE" | "BULLISH_RISK" | "BEARISH_RISK" | "NEUTRAL";
-
-const evaluatePcrEngine = (
-  values: number[],
-  strike: number | null,
-  anchors: TrendAnchors | null,
-  sessionAnchors: TrendAnchors | null
-): {
-  tone: Tone;
-  title: string;
-  subtitle: string;
-  trail: string;
-  latest: number;
-  slope: number;
-  anchors: TrendAnchors;
-} => {
-  const latest = values[values.length - 1];
-  const oldest = values[0];
-  const slope = latest - oldest;
-  const lastStep = values.length >= 2 ? values[values.length - 1] - values[values.length - 2] : 0;
-  const directionalSlope = Math.abs(slope) >= 0.01 ? slope : lastStep;
-  const bullishBias = directionalSlope === 0 ? latest >= oldest : directionalSlope > 0;
-  let trackedPeak = anchors?.peak ?? latest;
-  let trackedTrough = anchors?.trough ?? latest;
-  // Keep anchors monotonic so "peak-to-latest" / "trough-to-latest" moves never flip sign.
-  trackedPeak = Math.max(trackedPeak, latest);
-  trackedTrough = Math.min(trackedTrough, latest);
-  if (latest - trackedPeak >= REVERSAL_THRESHOLD_VALUE) trackedPeak = latest;
-  if (trackedTrough - latest >= REVERSAL_THRESHOLD_VALUE) trackedTrough = latest;
-  const referencePeak = sessionAnchors?.peak ?? trackedPeak;
-  const referenceTrough = sessionAnchors?.trough ?? trackedTrough;
-  const directionalMove = bullishBias
-    ? latest - referenceTrough
-    : referencePeak - latest;
-  const directionalMovePoints = Math.round(directionalMove * 100);
-  const state: EngineState = bullishBias
-    ? directionalMovePoints >= REVERSAL_THRESHOLD_POINTS
-      ? "BULLISH_VIEW_CONTINUE"
-      : "BULLISH_RISK"
-    : directionalMovePoints >= REVERSAL_THRESHOLD_POINTS
-      ? "BEARISH_VIEW_CONTINUE"
-      : "BEARISH_RISK";
-
-  return {
-    tone: bullishBias ? "bullish" : "bearish",
-    title:
-      state === "BULLISH_VIEW_CONTINUE"
-        ? "BULLISH VIEW CONTINUE"
-        : state === "BEARISH_VIEW_CONTINUE"
-          ? "BEARISH VIEW CONTINUE"
-          : state === "BULLISH_RISK"
-            ? "BULLISH RISK"
-            : "BEARISH RISK",
-    subtitle:
-      `${bullishBias ? "Base-to-latest" : "Peak-to-latest"} move ${(directionalMovePoints / 100).toFixed(2)}${
-        strike ? ` · Strike ${strike}` : ""
-      }`,
-    trail: bullishBias
-      ? formatTroughToLatestTrail(referenceTrough, latest)
-      : formatPeakToLatestTrail(referencePeak, latest),
-    latest,
-    slope,
-    anchors: {
-      peak: trackedPeak,
-      trough: trackedTrough
-    }
-  };
 };
 
 export default function PcrTableClient({
@@ -357,10 +506,6 @@ export default function PcrTableClient({
   const [flashKey, setFlashKey] = useState<string | null>(null);
   const lastTopKeyRef = useRef<string | null>(null);
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const trendAnchorsRef = useRef<{ "3m": TrendAnchors | null; "5m": TrendAnchors | null }>({
-    "3m": null,
-    "5m": null
-  });
 
   const load = async () => {
     try {
@@ -432,11 +577,14 @@ export default function PcrTableClient({
     };
   }, []);
 
+  const responseRows = useMemo(() => mergeIncomingRows([], data?.records || []), [data?.records]);
+  const effectiveRows = historyRows.length ? historyRows : responseRows;
+
   const orderedRows = useMemo(() => {
-    if (!historyRows.length) return [];
+    if (!effectiveRows.length) return [];
     // Render latest first for table and signals.
-    return historyRows.slice(-MAX_ROWS).map((item) => item.row).reverse();
-  }, [historyRows]);
+    return effectiveRows.slice(-MAX_ROWS).map((item) => item.row).reverse();
+  }, [effectiveRows]);
 
   const pcrExtremes = useMemo(() => {
     const extremes: Record<string, { high: number | null; low: number | null }> = {};
@@ -444,9 +592,9 @@ export default function PcrTableClient({
       extremes[header] = { high: null, low: null };
     }
 
-    for (const item of historyRows) {
+    for (const item of effectiveRows) {
       for (const header of pcrHeaders) {
-        const value = toNumeric(item.row[header]);
+        const value = getPcrValue(item.row, header);
         if (value === null) continue;
         const current = extremes[header];
         current.high = current.high === null ? value : Math.max(current.high, value);
@@ -455,74 +603,35 @@ export default function PcrTableClient({
     }
 
     return extremes;
-  }, [historyRows]);
+  }, [effectiveRows]);
 
-  const pcrTrendViews = useMemo((): { trend3m: TrendView; trend5m: TrendView } | null => {
-    if (!historyRows.length) return null;
+  const pcrTrendViews = useMemo((): { trend3m: PcrAnalysis; trend5m: PcrAnalysis } | null => {
+    if (!effectiveRows.length) return null;
 
-    const strike = data?.signals?.buildUpStrike ?? null;
-    const latestSeenAt = historyRows[historyRows.length - 1]?.seenAt ?? Date.now();
-    const sessionAnchors = getSessionAnchors(historyRows);
-    const buildTrendView = (windowMs: number, label: "3m" | "5m"): TrendView => {
-      const series = buildWindowSeries(historyRows, latestSeenAt, windowMs);
-
-      if (series.length < 2) {
-        trendAnchorsRef.current[label] = series.length === 1
-          ? { peak: series[0].value, trough: series[0].value }
-          : null;
-        const latest = series[series.length - 1]?.value ?? null;
-        return {
-          tone: "neutral",
-          title: `${label.toUpperCase()} TREND PENDING`,
-          subtitle: "Need at least 2 PCR samples",
-          trail: latest === null ? "" : formatPeakToLatestTrail(latest, latest),
-          latest,
-          slope: 0,
-          windowLabel: label
-        };
-      }
-
-      const oldestToLatest = series.map((point) => point.value);
-      const engine = evaluatePcrEngine(
-        oldestToLatest,
-        strike,
-        trendAnchorsRef.current[label],
-        sessionAnchors
-      );
-      trendAnchorsRef.current[label] = engine.anchors;
-      return {
-        tone: engine.tone,
-        title: engine.title,
-        subtitle: engine.subtitle,
-        trail: engine.trail,
-        latest: engine.latest,
-        slope: engine.slope,
-        windowLabel: label
-      };
-    };
+    const snapshots3m = buildIntervalSnapshots(effectiveRows, THREE_MIN_MS);
+    const snapshots5m = buildIntervalSnapshots(effectiveRows, FIVE_MIN_MS);
 
     return {
-      trend3m: buildTrendView(THREE_MIN_MS, "3m"),
-      trend5m: buildTrendView(FIVE_MIN_MS, "5m")
+      trend3m: analyzePCR(buildIntervalSeries(effectiveRows, THREE_MIN_MS), snapshots3m, "3m"),
+      trend5m: analyzePCR(buildIntervalSeries(effectiveRows, FIVE_MIN_MS), snapshots5m, "5m")
     };
-  }, [historyRows, data?.signals?.buildUpStrike]);
+  }, [effectiveRows]);
 
   useEffect(() => {
-    if (!historyRows.length) return;
-    const latestSeenAt = historyRows[historyRows.length - 1]?.seenAt ?? Date.now();
-    const threeMinute = buildWindowSeries(historyRows, latestSeenAt, THREE_MIN_MS).map((p) => ({
+    if (!effectiveRows.length) return;
+    const threeMinute = buildIntervalSeries(effectiveRows, THREE_MIN_MS).map((p) => ({
       at: new Date(p.at).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: true }),
       value: Number(p.value.toFixed(2))
     }));
-    const fiveMinute = buildWindowSeries(historyRows, latestSeenAt, FIVE_MIN_MS).map((p) => ({
+    const fiveMinute = buildIntervalSeries(effectiveRows, FIVE_MIN_MS).map((p) => ({
       at: new Date(p.at).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: true }),
       value: Number(p.value.toFixed(2))
     }));
-    const fullSession = historyRows.map((item) => {
-      const value = toNumeric(item.row[TREND_SOURCE]);
+    const fullSession = effectiveRows.map((item) => {
+      const normalizedValue = getPcrValue(item.row, TREND_SOURCE);
       return {
         at: new Date(item.seenAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: true }),
-        value: value === null ? null : Number(value.toFixed(2))
+        value: normalizedValue === null ? null : Number(normalizedValue.toFixed(2))
       };
     });
     (window as any).__pcrWindows = { threeMinute, fiveMinute };
@@ -538,20 +647,23 @@ export default function PcrTableClient({
       first: (window as any).__pcrSession.first,
       last: (window as any).__pcrSession.last
     });
-  }, [historyRows]);
+  }, [effectiveRows]);
 
   const currentPcrView = useMemo(() => {
     const latest = orderedRows[0];
-    const latestPcr = latest ? toNumeric(latest["Current All OI PCR"]) : null;
+    const latestPcr = latest ? getPcrValue(latest, "Current All OI PCR") : null;
     const hasBackendText =
       !!data?.signals?.pcrSignal?.trim() || !!data?.signals?.buildUpSignal?.trim();
 
     if (hasBackendText && data?.signals) {
+      const strikeSummary = [data.signals.buildUpStrike, data.signals.buildUpSecondaryStrike]
+        .filter((value): value is number => typeof value === "number")
+        .join(" / ");
       return {
         tone: data.signals.pcrTone,
         title: data.signals.pcrSignal,
         subtitle: `${data.signals.buildUpSignal || "Live signal"}${
-          data.signals.buildUpStrike ? ` · Strike ${data.signals.buildUpStrike}` : ""
+          strikeSummary ? ` · Strike ${strikeSummary}` : ""
         }`
       };
     }
@@ -570,8 +682,8 @@ export default function PcrTableClient({
   const analyticsView = useMemo(() => {
     if (!orderedRows.length || !pcrTrendViews) return null;
     const latestRow = orderedRows[0];
-    const latestAllPcr = toNumeric(latestRow[TREND_SOURCE]);
-    const latestFastPcr = toNumeric(latestRow["Current Change OI PCR"]);
+    const latestAllPcr = getPcrValue(latestRow, TREND_SOURCE);
+    const latestFastPcr = getPcrValue(latestRow, "Current Change OI PCR");
     const peChg = parseCompactVolume(latestRow["PE OI Change (±2)"]) ?? 0;
     const ceChg = parseCompactVolume(latestRow["CE OI Change (±2)"]) ?? 0;
     const oiDiff = peChg - ceChg;
@@ -585,7 +697,9 @@ export default function PcrTableClient({
     const trend5 = pcrTrendViews.trend5m;
     const trendAlignedBullish = trend3.tone === "bullish" && trend5.tone === "bullish";
     const trendAlignedBearish = trend3.tone === "bearish" && trend5.tone === "bearish";
-    const trendConflict = trend3.tone !== trend5.tone;
+    const trendConflict =
+      (trend3.tone === "bullish" && trend5.tone === "bearish") ||
+      (trend3.tone === "bearish" && trend5.tone === "bullish");
 
     let score = 50;
 
@@ -612,8 +726,9 @@ export default function PcrTableClient({
     const session = getIstSessionPhase();
     score = Math.round(Math.max(0, Math.min(100, score * session.multiplier)));
 
-    const pcrPoints = historyRows
-      .map((item) => toNumeric(item.row[TREND_SOURCE]))
+    const analyticsSourceRows = historyRows.length ? historyRows : responseRows;
+    const pcrPoints = analyticsSourceRows
+      .map((item) => getPcrValue(item.row, TREND_SOURCE))
       .filter((v): v is number => v !== null);
     const recentPoints = pcrPoints.slice(-20);
     const range =
@@ -637,10 +752,10 @@ export default function PcrTableClient({
     else if (Math.abs(netSlope) >= 0.12 && consistency >= 0.7) regime = "Trending";
 
     const divergenceAlerts: string[] = [];
-    if ((latestAllPcr ?? 0) >= 1.25 && trend5.slope <= -0.2) {
+    if ((latestAllPcr ?? 0) >= 1.25 && trend5.delta <= -PCR_VIEW_FLIP_DELTA) {
       divergenceAlerts.push("High PCR but falling fast: bullish exhaustion risk.");
     }
-    if ((latestAllPcr ?? 2) <= 0.75 && trend5.slope >= 0.12) {
+    if ((latestAllPcr ?? 2) <= 0.75 && trend5.delta >= PCR_VIEW_FLIP_DELTA) {
       divergenceAlerts.push("Low PCR but rising: bearish exhaustion / reversal watch.");
     }
     if (trendConflict) {
@@ -784,7 +899,7 @@ export default function PcrTableClient({
       entryWindowStatus,
       entryWindowReason
     };
-  }, [orderedRows, pcrTrendViews, data?.signals?.buildUpSignal, data?.vwapSignal, historyRows]);
+  }, [orderedRows, pcrTrendViews, data?.signals?.buildUpSignal, data?.vwapSignal, historyRows, responseRows]);
 
   const [signalJournal, setSignalJournal] = useState<JournalEntry[]>([]);
   const lastJournalKeyRef = useRef<string | null>(null);
@@ -853,20 +968,6 @@ export default function PcrTableClient({
             <div className={`sentiment right ${currentPcrView.tone}`}>
               <span>{currentPcrView.title}</span>
               <small>{currentPcrView.subtitle}</small>
-            </div>
-          )}
-          {pcrTrendViews?.trend3m && (
-            <div className={`sentiment ${pcrTrendViews.trend3m.tone}`}>
-              <span>3M: {pcrTrendViews.trend3m.title}</span>
-              <small>{pcrTrendViews.trend3m.subtitle}</small>
-              <small className="trend-trail">{pcrTrendViews.trend3m.trail}</small>
-            </div>
-          )}
-          {pcrTrendViews?.trend5m && (
-            <div className={`sentiment ${pcrTrendViews.trend5m.tone}`}>
-              <span>5M: {pcrTrendViews.trend5m.title}</span>
-              <small>{pcrTrendViews.trend5m.subtitle}</small>
-              <small className="trend-trail">{pcrTrendViews.trend5m.trail}</small>
             </div>
           )}
         </div>
@@ -951,82 +1052,92 @@ export default function PcrTableClient({
               </div>
             )}
           </div>
-          <div className="pcr-intel-card">
-            <div className="intel-head">
-              <span>Suggested Selling Strike</span>
-            </div>
-            {analyticsView.sellStrikePlan || analyticsView.itmCalendarPlan ? (
-              <div className="strike-plan">
-                <div className="row">
-                  <small>Strategy</small>
-                  <b>
-                    {analyticsView.sellStrikePlan
-                      ? analyticsView.sellStrikePlan.strategy
-                      : analyticsView.itmCalendarPlan?.strategy}
-                  </b>
+          <div className="pcr-intel-card pcr-signal-slot">
+            {pcrTrendViews?.trend3m && (
+              <div className={`sentiment signal-card ${pcrTrendViews.trend3m.tone}`}>
+                <div className="signal-top">
+                  <span className="signal-label">
+                    <span>3M PCR</span>
+                    {pcrTrendViews.trend3m.updatedAtLabel ? (
+                      <span className="signal-updated"> (Updated {pcrTrendViews.trend3m.updatedAtLabel})</span>
+                    ) : null}
+                  </span>
+                  <b className="signal-strength">{pcrTrendViews.trend3m.score}/3</b>
                 </div>
-                {analyticsView.sellStrikePlan && (
-                  <>
-                    <div className="row">
-                      <b>{analyticsView.sellStrikePlan.side}</b>
-                      <span>{analyticsView.sellStrikePlan.strike}</span>
-                    </div>
-                    <div className="row">
-                      <small>{analyticsView.sellStrikePlan.hedgeSide}</small>
-                      <span>{analyticsView.sellStrikePlan.hedgeStrike}</span>
-                    </div>
-                    <div className="row">
-                      <small>Relative Safety</small>
-                      <span
-                        className={`safe-pill ${
-                          analyticsView.sellStrikePlan.safety === "HIGH"
-                            ? "high"
-                            : analyticsView.sellStrikePlan.safety === "MEDIUM"
-                              ? "medium"
-                              : "low"
-                        }`}
-                      >
-                        {analyticsView.sellStrikePlan.safety}
+                <strong className="signal-title">{pcrTrendViews.trend3m.signal}</strong>
+                <div className="signal-detail-stack">
+                  <div className="signal-detail-box compact">
+                    <label>PCR / Delta</label>
+                    <b className="signal-pcr-flow">
+                      <span className="signal-pcr-prev">
+                        {pcrTrendViews.trend3m.previous?.toFixed(2) ?? pcrTrendViews.trend3m.pcr?.toFixed(2) ?? "-"}
                       </span>
+                      <span className="signal-pcr-arrow">-&gt;</span>
+                      <span className="signal-pcr-current">
+                        {(pcrTrendViews.trend3m.pcr?.toFixed(2) ?? "-") +
+                          ` (${pcrTrendViews.trend3m.delta >= 0 ? "+" : ""}${pcrTrendViews.trend3m.delta.toFixed(2)})`}
+                      </span>
+                    </b>
+                  </div>
+                  <div className="signal-track-box">
+                    <div className="signal-track-half up">
+                      <label>OI Up</label>
+                      <b>{pcrTrendViews.trend3m.oiIncreaseLabel}</b>
                     </div>
-                  </>
-                )}
-                {analyticsView.itmCalendarPlan && (
-                  <>
-                    <div className="row">
-                      <small>ITM Calendar Spot</small>
-                      <span>{analyticsView.itmCalendarPlan.spot}</span>
+                    <div className="signal-track-half down">
+                      <label>OI Down</label>
+                      <b>{pcrTrendViews.trend3m.oiDecreaseLabel}</b>
                     </div>
-                    <div className="row">
-                      <small>Direction</small>
-                      <b>{analyticsView.itmCalendarPlan.direction}</b>
-                    </div>
-                    <div className="row">
-                      <small>Strategy</small>
-                      <b>{analyticsView.itmCalendarPlan.strategy}</b>
-                    </div>
-                    <div className="row">
-                      <small>Strike</small>
-                      <b>{analyticsView.itmCalendarPlan.strike}</b>
-                    </div>
-                    <div className="row">
-                      <small>Sell Leg</small>
-                      <span>{analyticsView.itmCalendarPlan.sellLeg}</span>
-                    </div>
-                    <div className="row">
-                      <small>Buy Leg</small>
-                      <span>{analyticsView.itmCalendarPlan.buyLeg}</span>
-                    </div>
-                  </>
-                )}
-                <p className="disclaimer">
-                  For intraday guidance only. Re-check if trend flips or score weakens.
-                </p>
+                  </div>
+                </div>
+                <small>{pcrTrendViews.trend3m.momentum} · {pcrTrendViews.trend3m.trend}</small>
+                <small>{pcrTrendViews.trend3m.regime}</small>
+                <small className="signal-bias">{pcrTrendViews.trend3m.bias}</small>
               </div>
-            ) : (
-              <p className="journal-empty">
-                No confirmed setup yet. Strike suggestion appears only after 3m+5m confirmation.
-              </p>
+            )}
+          </div>
+          <div className="pcr-intel-card pcr-signal-slot">
+            {pcrTrendViews?.trend5m && (
+              <div className={`sentiment signal-card ${pcrTrendViews.trend5m.tone}`}>
+                <div className="signal-top">
+                  <span className="signal-label">
+                    <span>5M PCR</span>
+                    {pcrTrendViews.trend5m.updatedAtLabel ? (
+                      <span className="signal-updated"> (Updated {pcrTrendViews.trend5m.updatedAtLabel})</span>
+                    ) : null}
+                  </span>
+                  <b className="signal-strength">{pcrTrendViews.trend5m.score}/3</b>
+                </div>
+                <strong className="signal-title">{pcrTrendViews.trend5m.signal}</strong>
+                <div className="signal-detail-stack">
+                  <div className="signal-detail-box compact">
+                    <label>PCR / Delta</label>
+                    <b className="signal-pcr-flow">
+                      <span className="signal-pcr-prev">
+                        {pcrTrendViews.trend5m.previous?.toFixed(2) ?? pcrTrendViews.trend5m.pcr?.toFixed(2) ?? "-"}
+                      </span>
+                      <span className="signal-pcr-arrow">-&gt;</span>
+                      <span className="signal-pcr-current">
+                        {(pcrTrendViews.trend5m.pcr?.toFixed(2) ?? "-") +
+                          ` (${pcrTrendViews.trend5m.delta >= 0 ? "+" : ""}${pcrTrendViews.trend5m.delta.toFixed(2)})`}
+                      </span>
+                    </b>
+                  </div>
+                  <div className="signal-track-box">
+                    <div className="signal-track-half up">
+                      <label>OI Up</label>
+                      <b>{pcrTrendViews.trend5m.oiIncreaseLabel}</b>
+                    </div>
+                    <div className="signal-track-half down">
+                      <label>OI Down</label>
+                      <b>{pcrTrendViews.trend5m.oiDecreaseLabel}</b>
+                    </div>
+                  </div>
+                </div>
+                <small>{pcrTrendViews.trend5m.momentum} · {pcrTrendViews.trend5m.trend}</small>
+                <small>{pcrTrendViews.trend5m.regime}</small>
+                <small className="signal-bias">{pcrTrendViews.trend5m.bias}</small>
+              </div>
             )}
           </div>
         </div>
@@ -1062,13 +1173,25 @@ export default function PcrTableClient({
 
               return (
                 <tr key={rowKey} className={rowClass}>
-                {headers.map((h) => (
-                  <td key={h} className={h.includes("PCR") ? "pcr-col" : undefined}>
-                    {typeof row[h] === "number" && !isRatioColumn(h)
+                {headers.map((h) => {
+                  const oiMeta = getSignedOiCellMeta(h, row[h]);
+                  const className = [h.includes("PCR") ? "pcr-col" : "", oiMeta?.className || ""]
+                    .filter(Boolean)
+                    .join(" ");
+                  const normalizedPcrValue = pcrHeaderSet.has(h) ? getPcrValue(row, h) : null;
+                  const displayValue =
+                    normalizedPcrValue !== null
+                      ? normalizedPcrValue.toFixed(2)
+                      : typeof row[h] === "number" && !isRatioColumn(h)
                       ? formatVolume(row[h] as number)
-                      : row[h] ?? "-"}
-                  </td>
-                ))}
+                      : row[h] ?? "-";
+
+                  return (
+                    <td key={h} className={className || undefined} title={oiMeta?.title}>
+                      {displayValue}
+                    </td>
+                  );
+                })}
                 </tr>
               );
             })}

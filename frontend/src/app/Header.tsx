@@ -1,11 +1,13 @@
 "use client";
 
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useSession, signOut } from "next-auth/react";
 import { useEffect, useRef, useState } from "react";
 
 export default function Header() {
   const { data: session } = useSession();
+  const pathname = usePathname();
   const user = session?.user;
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -21,6 +23,10 @@ export default function Header() {
     document.addEventListener("click", onClick);
     return () => document.removeEventListener("click", onClick);
   }, []);
+
+  useEffect(() => {
+    setOcOpen(false);
+  }, [pathname]);
 
   return (
     <header className="app-header">
@@ -43,8 +49,12 @@ export default function Header() {
             Option Chain <span className="caret">▾</span>
           </button>
           <div className="nav-dropdown">
-            <Link href="/nifty/option-chain">NIFTY</Link>
-            <Link href="/sensex/option-chain">SENSEX</Link>
+            <Link href="/nifty/option-chain" onClick={() => setOcOpen(false)}>
+              NIFTY
+            </Link>
+            <Link href="/sensex/option-chain" onClick={() => setOcOpen(false)}>
+              SENSEX
+            </Link>
           </div>
         </div>
         <Link href="/subscription">Subscription</Link>

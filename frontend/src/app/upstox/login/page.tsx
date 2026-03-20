@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 
 type State =
   | { status: "idle" }
@@ -11,6 +12,7 @@ type State =
 
 export default function UpstoxLoginPage() {
   const [state, setState] = useState<State>({ status: "idle" });
+  const router = useRouter();
 
   const code = useMemo(() => {
     if (typeof window === "undefined") return null;
@@ -39,9 +41,10 @@ export default function UpstoxLoginPage() {
         return;
       }
       setState({ status: "exchanged" });
+      router.replace("/nifty/option-chain");
     };
     void load();
-  }, [code]);
+  }, [code, router]);
 
   return (
     <main className="page">
@@ -53,14 +56,7 @@ export default function UpstoxLoginPage() {
           Sign in with Upstox
         </a>
       )}
-      {state.status === "exchanged" && (
-        <>
-          <p>Access token stored on the server.</p>
-          <a href="/nifty/option-chain" className="btn">
-            Go to Option Chain
-          </a>
-        </>
-      )}
+      {state.status === "exchanged" && <p>Login successful. Redirecting to option chain…</p>}
     </main>
   );
 }

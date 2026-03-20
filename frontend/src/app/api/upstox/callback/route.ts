@@ -53,7 +53,8 @@ export async function GET(req: Request) {
       });
     }
 
-    return NextResponse.json(res.data);
+    const baseUrl = new URL(req.url).origin;
+    return NextResponse.redirect(new URL("/nifty/option-chain", baseUrl));
   } catch (error: any) {
     console.error("Upstox token error:", error?.response?.data || error);
 
