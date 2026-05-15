@@ -1,0 +1,8 @@
+{
+  "/api/nifty/option-chain/route": "app/api/nifty/option-chain/route.js",
+  "/api/nifty/pcr/route": "app/api/nifty/pcr/route.js",
+  "/api/upstox/ltp/route": "app/api/upstox/ltp/route.js",
+  "/api/auth/[...nextauth]/route": "app/api/auth/[...nextauth]/route.js",
+  "/page": "app/page.js",
+  "/nifty/option-chain/page": "app/nifty/option-chain/page.js"
+}

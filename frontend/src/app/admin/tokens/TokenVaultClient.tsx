@@ -37,14 +37,15 @@ export default function TokenVaultClient() {
           <div className="eyebrow">Admin Tools</div>
           <h1>Upstox Token Vault</h1>
           <p className="muted-text">
-            Paste the latest access token. This will replace the current token used by the API.
+            Paste an Upstox token to replace the current API token. For longer stability, use a read-only
+            Analytics Token instead of a daily OAuth access token.
           </p>
         </div>
       </div>
 
       <form className="vault-form" onSubmit={submit}>
         <label className="vault-label" htmlFor="accessToken">
-          Access Token
+          Upstox Token
         </label>
         <textarea
           id="accessToken"
@@ -52,7 +53,7 @@ export default function TokenVaultClient() {
           value={accessToken}
           onChange={(e) => setAccessToken(e.target.value)}
           rows={4}
-          placeholder="Paste the Upstox access token here"
+          placeholder="Paste the Upstox access token or Analytics Token here"
           required
         />
         <div className="vault-actions">

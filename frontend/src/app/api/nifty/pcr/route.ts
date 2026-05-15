@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { getUpstoxAccessToken } from "@/lib/upstox";
 
 const UPSTOX_API = "https://api.upstox.com/v2";
 const DEFAULT_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50";
@@ -36,11 +37,7 @@ const DEDUPE_FIELDS = [
 ] as const;
 
 async function getAccessToken() {
-  const { prisma } = await import("@/lib/prisma");
-  const latest = await prisma.upstoxSession.findFirst({
-    orderBy: { createdAt: "desc" }
-  });
-  return latest?.accessToken || null;
+  return getUpstoxAccessToken();
 }
 
 async function upstoxGet(path: string, params: Record<string, string>, token: string) {

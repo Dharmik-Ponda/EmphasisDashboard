@@ -1,14 +1,12 @@
 import { NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
+import { getUpstoxAccessToken } from "@/lib/upstox";
 
 const UPSTOX_API = "https://api.upstox.com/v2";
 
 export async function GET(req: Request) {
   try {
-    const latest = await prisma.upstoxSession.findFirst({
-      orderBy: { createdAt: "desc" }
-    });
-    if (!latest?.accessToken) {
+    const token = await getUpstoxAccessToken();
+    if (!token) {
       return NextResponse.json(
         { error: "No access token found. Please login via /upstox/login." },
         { status: 401 }
@@ -30,7 +28,7 @@ export async function GET(req: Request) {
       headers: {
         Accept: "application/json",
         "Api-Version": "2.0",
-        Authorization: `Bearer ${latest.accessToken}`
+        Authorization: `Bearer ${token}`
       }
     });
     const data = await res.json().catch(() => ({}));

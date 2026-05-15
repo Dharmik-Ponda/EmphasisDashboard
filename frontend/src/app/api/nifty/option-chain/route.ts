@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
+import { getUpstoxAccessToken } from "@/lib/upstox";
 
 const UPSTOX_API = "https://api.upstox.com/v2";
 const DEFAULT_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50";
@@ -35,10 +35,7 @@ type PriceCandle = {
 };
 
 async function getAccessToken() {
-  const latest = await prisma.upstoxSession.findFirst({
-    orderBy: { createdAt: "desc" }
-  });
-  return latest?.accessToken || null;
+  return getUpstoxAccessToken();
 }
 
 async function upstoxGet(path: string, params: Record<string, string>, token: string) {

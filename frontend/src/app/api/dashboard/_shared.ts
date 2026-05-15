@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import zlib from "zlib";
-import { prisma } from "@/lib/prisma";
+import { getUpstoxAccessToken } from "@/lib/upstox";
 
 export const UPSTOX_API = "https://api.upstox.com/v2";
 export const INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz";
@@ -12,9 +12,7 @@ export const QUOTE_TTL_MS = 5 * 60 * 1000;
 export const BATCH_SIZE = 500;
 
 export async function getAccessToken() {
-  const latest = await prisma.upstoxSession.findFirst({ orderBy: { createdAt: "desc" } });
-  if (!latest?.accessToken) return null;
-  return latest.accessToken;
+  return getUpstoxAccessToken();
 }
 
 export async function fetchInstruments() {
