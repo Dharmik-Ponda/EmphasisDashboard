@@ -42,6 +42,7 @@ type JournalEntry = {
   direction: "BULLISH" | "BEARISH";
   score: number;
   reason: string;
+  spot: number | null;
 };
 type PcrSamplePoint = {
   at: number;
@@ -121,7 +122,13 @@ const toNumeric = (value: unknown) => {
 const getPcrValue = (row: PcrRecord, header: string) => {
   const value = toNumeric(row[header]);
   if (value === null) return null;
-  return pcrHeaderSet.has(header) ? Math.max(0, value) : value;
+  if (!pcrHeaderSet.has(header)) return value;
+  // Change-OI PCRs are capped at 0.1–10 (matches the API). This also cleans old rows
+  // saved in localStorage when the API returned raw OI sums like 34124285.
+  if (header === "ALL Change OI PCR" || header === "Current Change OI PCR") {
+    return Math.min(10, Math.max(0.1, value));
+  }
+  return Math.max(0, value);
 };
 
 const normalizePcrRecord = (row: PcrRecord): PcrRecord => {
@@ -135,7 +142,11 @@ const normalizePcrRecord = (row: PcrRecord): PcrRecord => {
 
 const MAX_ROWS = 5;
 const HISTORY_MAX_ROWS = 2000;
-const PCR_HISTORY_STORAGE_PREFIX = "pcr-history";
+// v2: change-PCR formula changed on 19 Nov 2026 (PCR now ÷ PCR at open); old saved rows are not comparable.
+const PCR_HISTORY_STORAGE_PREFIX = "pcr-history-v3";
+// Rows from the API carry `formula`; anything older is from the old change-PCR formula.
+const PCR_FORMULA_VERSION = 2;
+const isCurrentFormula = (row: PcrRecord) => Number(row?.formula) === PCR_FORMULA_VERSION;
 const THREE_MIN_MS = 3 * 60 * 1000;
 const FIVE_MIN_MS = 5 * 60 * 1000;
 const TREND_SOURCE = "ALL Change OI PCR";
@@ -187,6 +198,7 @@ const mergeIncomingRows = (previousRows: DisplayRow[], incomingRecords: PcrRecor
   };
 
   for (const row of incomingOrdered) {
+    if (!isCurrentFormula(row)) continue;
     const normalizedRow = normalizePcrRecord(row);
     const key = buildRowKey(normalizedRow);
     if (previousKeys.has(key)) continue;
@@ -539,7 +551,8 @@ export default function PcrTableClient({
             typeof item.key === "string" &&
             typeof item.seenAt === "number" &&
             item.row &&
-            typeof item.row === "object"
+            typeof item.row === "object" &&
+            isCurrentFormula(item.row)
         )
       );
       if (valid.length) setHistoryRows(valid);
@@ -883,7 +896,40 @@ export default function PcrTableClient({
       }
     }
 
+    // One-line verdict that combines everything above, so the screen gives one answer.
+    const waitReasons: string[] = [];
+    if (direction !== "NO TRADE") {
+      if (!fastTriggerAligned) waitReasons.push("fast PCR not aligned");
+      if (direction === "BULLISH" && trend3.tone !== "bullish") waitReasons.push("3m not bullish");
+      if (direction === "BEARISH" && trend3.tone !== "bearish") waitReasons.push("3m not bearish");
+      if (!confirmed) waitReasons.push("5m not confirmed");
+      if (trendConflict) waitReasons.push("3m/5m conflict");
+      if (regime === "Volatile/Choppy") waitReasons.push("choppy regime");
+      if (entryWindowStatus === "AVOID") waitReasons.push(`${session.name.toLowerCase()} time`);
+    }
+    let verdict: { tone: Tone; action: string; detail: string };
+    if (direction === "NO TRADE") {
+      verdict = {
+        tone: "neutral",
+        action: "NO TRADE",
+        detail: `No clear direction (score ${score}). Stay out or keep spreads wide.`
+      };
+    } else if (checklistReady && entryWindowStatus !== "AVOID" && sellStrikePlan) {
+      verdict = {
+        tone: direction === "BULLISH" ? "bullish" : "bearish",
+        action: `ENTER ${sellStrikePlan.strategy}${entryWindowStatus === "CAUTION" ? " (smaller size)" : ""}`,
+        detail: `${sellStrikePlan.side} ${sellStrikePlan.strike} · ${sellStrikePlan.hedgeSide} ${sellStrikePlan.hedgeStrike} · safety ${sellStrikePlan.safety}`
+      };
+    } else {
+      verdict = {
+        tone: "neutral",
+        action: `${direction} BIAS · WAIT`,
+        detail: `Not yet: ${waitReasons.join(", ") || "checklist incomplete"}.`
+      };
+    }
+
     return {
+      verdict,
       score,
       regime,
       direction,
@@ -920,12 +966,32 @@ export default function PcrTableClient({
     });
 
     setSignalJournal((prev) =>
-      [{ id: `${Date.now()}-${key}`, at, direction, score: analyticsView.score, reason }, ...prev].slice(
+      [
+        {
+          id: `${Date.now()}-${key}`,
+          at,
+          direction,
+          score: analyticsView.score,
+          reason,
+          spot: typeof data?.underlying === "number" ? data.underlying : null
+        },
+        ...prev
+      ].slice(
         0,
         MAX_JOURNAL_ROWS
       )
     );
   }, [analyticsView]);
+
+  // Share the verdict with the option chain (it uses the direction for the intraday ★ strike).
+  const verdictDirection = analyticsView?.direction ?? null;
+  const verdictAction = analyticsView?.verdict.action ?? null;
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const detail = { direction: verdictDirection, action: verdictAction };
+    (window as any).__emphasisVerdict = detail;
+    window.dispatchEvent(new CustomEvent("emphasis:verdict", { detail }));
+  }, [verdictDirection, verdictAction]);
 
   useEffect(() => {
     if (!orderedRows.length) return;
@@ -976,20 +1042,14 @@ export default function PcrTableClient({
         <div className="pcr-intel-grid">
           <div className="pcr-intel-card">
             <div className="intel-head">
-              <span>Best Entry Window</span>
-              <span
-                className={`intel-badge ${
-                  analyticsView.entryWindowStatus === "OPEN"
-                    ? "bullish"
-                    : analyticsView.entryWindowStatus === "CAUTION"
-                      ? "neutral"
-                      : "bearish"
-                }`}
-              >
-                {analyticsView.entryWindowStatus}
+              <span>Verdict</span>
+              <span className={`intel-badge ${analyticsView.verdict.tone}`}>
+                {analyticsView.verdict.action}
               </span>
             </div>
-            <p className="journal-empty">{analyticsView.entryWindowReason}</p>
+            <p className="journal-empty" style={{ fontWeight: 600 }}>
+              {analyticsView.verdict.detail}
+            </p>
             <div className="intel-score-row">
               <div className="intel-score">
                 <strong>{analyticsView.score}</strong>
@@ -1001,7 +1061,12 @@ export default function PcrTableClient({
                   <b>{analyticsView.direction}</b>
                 </div>
                 <div><span>Regime</span><b>{analyticsView.regime}</b></div>
-                <div><span>Session</span><b>{analyticsView.sessionName}</b></div>
+                <div>
+                  <span>Session</span>
+                  <b>
+                    {analyticsView.sessionName} · {analyticsView.entryWindowStatus}
+                  </b>
+                </div>
                 <div><span>OI Flow PE/CE</span><b>{analyticsView.oiSummary}</b></div>
               </div>
             </div>
@@ -1017,6 +1082,22 @@ export default function PcrTableClient({
               </div>
               <div className={analyticsView.confirmed ? "ok" : "wait"}>
                 {analyticsView.confirmed ? "PASS" : "WAIT"} Trend Confirmed (5m aligned)
+              </div>
+              <div
+                className={
+                  analyticsView.entryWindowStatus === "OPEN"
+                    ? "ok"
+                    : analyticsView.entryWindowStatus === "CAUTION"
+                      ? "warn"
+                      : "wait"
+                }
+              >
+                {analyticsView.entryWindowStatus === "OPEN"
+                  ? "PASS"
+                  : analyticsView.entryWindowStatus === "CAUTION"
+                    ? "CAUTION"
+                    : "WAIT"}{" "}
+                Time Window ({analyticsView.sessionName})
               </div>
               <div className={analyticsView.exitWarning ? "warn" : "ok"}>
                 {analyticsView.exitWarning ? "CAUTION" : "HOLD"} Exit Signal Check
@@ -1047,6 +1128,25 @@ export default function PcrTableClient({
                     </span>
                     <span className="score">Score {entry.score}</span>
                     <span className="reason">{entry.reason}</span>
+                    {entry.spot !== null && (
+                      <span
+                        className="reason"
+                        title="Nifty at signal → move since (positive = signal was right)"
+                      >
+                        @ {Math.round(entry.spot).toLocaleString("en-IN")}
+                        {typeof data?.underlying === "number" &&
+                          (() => {
+                            const move = data.underlying - (entry.spot as number);
+                            const right = entry.direction === "BULLISH" ? move : -move;
+                            return (
+                              <b style={{ color: right >= 0 ? "#15803d" : "#b91c1c", marginLeft: 4 }}>
+                                {right >= 0 ? "+" : ""}
+                                {Math.round(right)} pts
+                              </b>
+                            );
+                          })()}
+                      </span>
+                    )}
                   </div>
                 ))}
               </div>

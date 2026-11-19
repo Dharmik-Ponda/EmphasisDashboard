@@ -11,6 +11,7 @@ async function getOptionChain(instrumentKey: string) {
     const url = new URL("/api/nifty/option-chain", baseUrl);
     url.searchParams.set("instrument_key", instrumentKey);
     url.searchParams.set("include_history", "1");
+    url.searchParams.set("window", "12");
     const res = await fetch(url.toString(), {
       cache: "no-store"
     });

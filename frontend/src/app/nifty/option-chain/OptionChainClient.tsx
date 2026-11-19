@@ -1,12 +1,28 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import {
+  getIntradayPicks,
+  getIntradayPhase,
+  getIstMinutes,
+  HEDGE_WIDTH_POINTS,
+  INTRADAY_STOP_PCT,
+  INTRADAY_TARGET_PCT,
+  type IntradayDirection,
+  type SellerPick
+} from "./StrikeScanner";
 
 const formatNumber = (value: number | null | undefined) => {
   if (value === null || value === undefined) return "-";
   return new Intl.NumberFormat("en-IN", {
     maximumFractionDigits: 2
   }).format(value);
+};
+
+// Gamma for Nifty is ~0.0005–0.002, so 2 decimals showed 0 everywhere.
+const formatGamma = (value: number | null | undefined) => {
+  if (value === null || value === undefined) return "-";
+  return value.toFixed(4);
 };
 
 const formatCompact = (value: number | null | undefined) => {
@@ -126,38 +142,104 @@ export default function OptionChainClient({
     : toNumber(data.chain[Math.floor(data.chain.length / 2)]?.strike);
   const atmIndex =
     atmStrike !== null ? data.chain.findIndex((row: any) => row.strike === atmStrike) : -1;
-  const windowSize = data.window ?? 5;
+  // API returns ATM ±12; the table shows ATM ±8 so the ★ sell strikes are visible.
+  const windowSize = 8;
   const start = atmIndex >= 0 ? Math.max(0, atmIndex - windowSize) : 0;
   const end = atmIndex >= 0 ? Math.min(data.chain.length, atmIndex + windowSize + 1) : data.chain.length;
   const visibleChain = data.chain.slice(start, end);
   const maxCallOi = Math.max(
     1,
-    ...data.chain.map((row: any) => {
+    ...visibleChain.map((row: any) => {
       const oi = pickNumber(getMarket(row.call), ["oi", "open_interest"]);
       return oi || 0;
     })
   );
   const maxPutOi = Math.max(
     1,
-    ...data.chain.map((row: any) => {
+    ...visibleChain.map((row: any) => {
       const oi = pickNumber(getMarket(row.put), ["oi", "open_interest"]);
       return oi || 0;
     })
   );
   const maxCallOiChg = Math.max(
     1,
-    ...data.chain.map((row: any) => {
+    ...visibleChain.map((row: any) => {
       const chg = oiChange(getMarket(row.call));
       return chg ? Math.abs(chg) : 0;
     })
   );
   const maxPutOiChg = Math.max(
     1,
-    ...data.chain.map((row: any) => {
+    ...visibleChain.map((row: any) => {
       const chg = oiChange(getMarket(row.put));
       return chg ? Math.abs(chg) : 0;
     })
   );
+
+  // ---- Option-seller summary ----
+  // Expected move = ATM call LTP + ATM put LTP (straddle price) for this expiry.
+  const atmRow = atmStrike !== null ? data.chain.find((row: any) => row.strike === atmStrike) : null;
+  const atmCallLtp = atmRow ? pickNumber(getMarket(atmRow.call), ["ltp", "last_price", "last_traded_price"]) : null;
+  const atmPutLtp = atmRow ? pickNumber(getMarket(atmRow.put), ["ltp", "last_price", "last_traded_price"]) : null;
+  // Only trust the straddle when we know the spot price (otherwise "ATM" is just the middle strike).
+  const straddle =
+    spotPrice && atmCallLtp !== null && atmPutLtp !== null ? atmCallLtp + atmPutLtp : null;
+  const expectedLow = straddle !== null && spotPrice ? spotPrice - straddle : null;
+  const expectedHigh = straddle !== null && spotPrice ? spotPrice + straddle : null;
+
+  // ---- Intraday ★ (enter in the morning, square off by 3:15) ----
+  // Direction comes from the Verdict card (PcrTableClient broadcasts it).
+  const [verdictDirection, setVerdictDirection] = useState<IntradayDirection>(null);
+  useEffect(() => {
+    const initial = (window as any).__emphasisVerdict?.direction ?? null;
+    if (initial) setVerdictDirection(initial);
+    const onVerdict = (e: Event) => setVerdictDirection((e as CustomEvent).detail?.direction ?? null);
+    window.addEventListener("emphasis:verdict", onVerdict);
+    return () => window.removeEventListener("emphasis:verdict", onVerdict);
+  }, []);
+
+  const atmCallIv = atmRow ? pickNumber(getGreeks(atmRow.call), ["iv", "implied_volatility"]) : null;
+  const atmPutIv = atmRow ? pickNumber(getGreeks(atmRow.put), ["iv", "implied_volatility"]) : null;
+  const atmIv =
+    atmCallIv && atmPutIv ? (atmCallIv + atmPutIv) / 2 : atmCallIv || atmPutIv || null;
+  const istMinutes = getIstMinutes();
+  const phase = getIntradayPhase(istMinutes);
+  const { putPick, callPick, putWall, callWall, move: dayMove } = getIntradayPicks(
+    visibleChain,
+    spotPrice,
+    atmIv,
+    verdictDirection,
+    istMinutes
+  );
+  const phaseInfo: Record<string, { label: string; tone: string; note: string }> = {
+    PRE_OPEN: { label: "Pre-open", tone: "muted", note: "Market not open yet." },
+    OPENING: { label: "Watch only", tone: "warn", note: "Opening period: watch, entries from 10:00." },
+    ENTRY: { label: "Entry window", tone: "ok", note: "Entry window (10:00–1:30) if the Verdict says ENTER." },
+    LATE: { label: "Late: small size", tone: "warn", note: "After 1:30: no new trades unless fully aligned, small size." },
+    SQUARE_OFF: { label: "Square off by 3:15", tone: "bad", note: "Close all intraday positions by 3:15." },
+    CLOSED: { label: "Closed", tone: "muted", note: "Market closed." }
+  };
+  const phaseView = phaseInfo[phase];
+  const pickTitle = (p: SellerPick) => {
+    const stop = p.ltp * (1 + INTRADAY_STOP_PCT / 100);
+    const target = p.ltp * (1 - INTRADAY_TARGET_PCT / 100);
+    const dirText =
+      verdictDirection === "BULLISH" || verdictDirection === "BEARISH"
+        ? `Verdict ${verdictDirection}`
+        : "No clear direction: neutral, both sides shown";
+    return (
+      `★ Intraday sell ${p.strike} ${p.side} @ ${p.ltp.toFixed(2)} · Δ ${p.delta.toFixed(2)} · Θ ${p.theta.toFixed(1)}/day` +
+      `\nStop ${stop.toFixed(2)} (+${INTRADAY_STOP_PCT}%) · Target ${target.toFixed(2)} (−${INTRADAY_TARGET_PCT}%) · Square off by 3:15` +
+      `\n${dirText} · Rest-of-day move ±${dayMove !== null ? Math.round(dayMove) : "-"} pts` +
+      (p.hedgeStrike !== null && p.spreadCredit !== null
+        ? `\nOptional hedge (lower margin): buy ${p.hedgeStrike} ${p.side} → spread credit ${p.spreadCredit.toFixed(
+            2
+          )}, max loss ${(HEDGE_WIDTH_POINTS - p.spreadCredit).toFixed(2)}`
+        : "") +
+      `\n${phaseView.note}` +
+      `\nRule: Δ 0.25–0.40 strike with the best decay per unit of risk for the rest of today.`
+    );
+  };
 
   const loadExpiry = async (expiry: string, silent = false) => {
     if (expiry === data.expiry && !silent) return;
@@ -166,6 +248,7 @@ export default function OptionChainClient({
     try {
       const url = new URL("/api/nifty/option-chain", window.location.origin);
       url.searchParams.set("expiry_date", expiry);
+      url.searchParams.set("window", "12");
       if (instrumentKey) url.searchParams.set("instrument_key", instrumentKey);
       const res = await fetch(url.toString(), {
         cache: "no-store"
@@ -197,6 +280,7 @@ export default function OptionChainClient({
       try {
         const url = new URL("/api/nifty/option-chain", window.location.origin);
         url.searchParams.set("expiry_date", activeExpiry);
+        url.searchParams.set("window", "12");
         if (instrumentKey) url.searchParams.set("instrument_key", instrumentKey);
         const res = await fetch(url.toString(), {
           cache: "no-store"
@@ -324,6 +408,61 @@ export default function OptionChainClient({
             border-color: #86efac !important;
             transition: background-color 0.3s ease-out;
           }
+          .oc-bar {
+            display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px;
+            padding: 8px 12px; margin: 8px 0; background: #fff;
+            border: 1px solid #e5e7eb; border-radius: 12px; font-size: 13px;
+          }
+          .oc-bar .oc-title { font-size: 17px; font-weight: 800; color: #0f172a; white-space: nowrap; }
+          .oc-bar .oc-item { white-space: nowrap; }
+          .oc-bar .label {
+            font-size: 10.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+            color: #64748b; margin-right: 5px;
+          }
+          .oc-bar b { color: #0f172a; }
+          .oc-phase {
+            font-size: 11px; font-weight: 700; border-radius: 999px; padding: 2px 10px; white-space: nowrap;
+            border: 1px solid transparent;
+          }
+          .oc-phase.ok { background: #dcfce7; color: #166534; border-color: #86efac; }
+          .oc-phase.warn { background: #fef3c7; color: #92400e; border-color: #fcd34d; }
+          .oc-phase.bad { background: #fee2e2; color: #991b1b; border-color: #fca5a5; }
+          .oc-phase.muted { background: #f1f5f9; color: #475569; border-color: #e2e8f0; }
+          .oc-expiries { display: flex; gap: 4px; margin-left: auto; flex-wrap: wrap; }
+          .oc-exp {
+            border: 1px solid #e2e8f0; background: #fff; border-radius: 8px;
+            padding: 3px 8px; font-size: 12px; font-weight: 600; cursor: pointer; color: #0f172a;
+          }
+          .oc-exp.active { background: #0f2a5f; color: #fff; border-color: #0f2a5f; }
+          /* Compact rows: less top/bottom padding so more strikes fit on one screen. */
+          .oc-table-wrap table.chain tbody td { padding-top: 5px; padding-bottom: 5px; line-height: 1.2; }
+          .oc-table-wrap table.chain thead th { padding-top: 6px; padding-bottom: 6px; }
+          .oc-table-wrap .oi-bar { margin-bottom: 2px !important; }
+          .oc-table-wrap td > div:not(.oi-bar) { white-space: nowrap; }
+          .oc-table-wrap .strike-main { line-height: 1.15; }
+          .oc-table-wrap .strike-pcr {
+            margin-top: 1px !important; padding-top: 0 !important; padding-bottom: 0 !important;
+            font-size: 10px !important; line-height: 1.4 !important; white-space: nowrap;
+          }
+          /* ★ sell strike: navy theme tint + outline; marks are absolutely positioned
+             so they never change row height or column width. */
+          td.oc-pick {
+            position: relative;
+            background-color: rgba(30, 58, 138, 0.10) !important;
+            box-shadow: inset 0 0 0 2px #1e3a8a;
+            color: #1e3a8a;
+            font-weight: 700;
+          }
+          td.oc-has-wall { position: relative; }
+          .oc-star {
+            position: absolute; top: 3px; left: 5px;
+            font-size: 11px; line-height: 1; color: #1e3a8a; cursor: help;
+          }
+          .oc-wall {
+            position: absolute; top: 3px; right: 4px;
+            font-size: 9px; line-height: 1.3; font-weight: 700; white-space: nowrap;
+            background: #1e3a8a; color: #fff; border-radius: 4px; padding: 0 4px; cursor: help;
+          }
           .highlight-red {
             background-color: #fee2e2 !important;
             border-color: #fca5a5 !important;
@@ -331,47 +470,62 @@ export default function OptionChainClient({
           }
         `}
       </style>
-      <div className="oc-header">
-        <div className="title-block">
-          <div className="eyebrow">Option Chain</div>
-          <h1>
-            {symbol} <span className="muted">·</span> {data.expiry}
-          </h1>
-          <div className="subtitle">
-            <span className="label">Underlying</span>
-            <span className="value">{formatNumber(spotPrice)}</span>
-            <span className="dot">•</span>
-            <span className="label">Step</span>
-            <span className="value">{formatNumber(data.step)}</span>
-          </div>
-        </div>
-        <div className="right-stack">
-          <div className="metrics">
-            <span className="pill metric">
-              <span className="label">Max Pain</span>
-              <span className="value">{formatNumber(data.maxPain)}</span>
-            </span>
-            {data.vix !== null && (
-              <span className="pill metric">
-                <span className="label">India VIX</span>
-                <span className="value">{formatNumber(data.vix)}</span>
-              </span>
-            )}
-            {loading && <span className="pill">Loading…</span>}
-          </div>
-          <div className="expiry-tabs">
-            {(data.expiries || []).map((exp: string) => (
-              <button
-                key={exp}
-                type="button"
-                className={exp === data.expiry ? "tab active" : "tab"}
-                onClick={() => loadExpiry(exp)}
-              >
-                {exp}
-              </button>
-            ))}
-          </div>
-        </div>
+      <div className="oc-bar">
+        <span className="oc-title">
+          {symbol} <span className="muted">·</span> {data.expiry}
+        </span>
+        <span className="oc-item">
+          <span className="label">Spot</span>
+          <b>{formatNumber(spotPrice)}</b>
+        </span>
+        <span className="oc-item">
+          <span className="label">Step</span>
+          <b>{formatNumber(data.step)}</b>
+        </span>
+        {data.vix !== null && (
+          <span className="oc-item">
+            <span className="label">VIX</span>
+            <b>{formatNumber(data.vix)}</b>
+          </span>
+        )}
+        <span className="oc-item" title="ATM call + ATM put premium. Market's expected move by expiry.">
+          <span className="label">ATM Straddle</span>
+          <b>{formatNumber(straddle)}</b>
+        </span>
+        <span
+          className="oc-item"
+          title="Spot ± ATM straddle. Selling outside this range keeps you outside the expected move."
+        >
+          <span className="label">Expected Range</span>
+          <b>
+            {expectedLow !== null && expectedHigh !== null
+              ? `${formatNumber(Math.round(expectedLow))} – ${formatNumber(Math.round(expectedHigh))}`
+              : "-"}
+          </b>
+        </span>
+        <span
+          className="oc-item"
+          title="1-SD Nifty move expected for the rest of today's session (from ATM IV). Intraday ★ uses this."
+        >
+          <span className="label">Rest-of-Day Move</span>
+          <b>{dayMove !== null ? `±${Math.round(dayMove)}` : "-"}</b>
+        </span>
+        <span className={`oc-phase ${phaseView.tone}`} title={phaseView.note}>
+          {phaseView.label}
+        </span>
+        {loading && <span className="oc-item">Loading…</span>}
+        <span className="oc-expiries">
+          {(data.expiries || []).map((exp: string) => (
+            <button
+              key={exp}
+              type="button"
+              className={exp === data.expiry ? "oc-exp active" : "oc-exp"}
+              onClick={() => loadExpiry(exp)}
+            >
+              {exp}
+            </button>
+          ))}
+        </span>
       </div>
       {error && <p className="error">{error}</p>}
       <div className="table-wrap oc-table-wrap">
@@ -445,12 +599,16 @@ export default function OptionChainClient({
                 strikePcr === null ? "neutral" : strikePcr > 1 ? "bullish" : strikePcr < 1 ? "bearish" : "neutral";
 
               const isAtm = atmStrike !== null && row.strike === atmStrike;
+              const isCallPick = callPick?.strike === row.strike;
+              const isPutPick = putPick?.strike === row.strike;
+              const isCallWall = callWall?.strike === row.strike;
+              const isPutWall = putWall?.strike === row.strike;
               return (
                 <tr key={row.strike} className={isAtm ? "row-atm" : undefined}>
                   <td className="calls">{formatCompact(callVol)}</td>
                   <td className="calls">{formatNumber(callIv)}</td>
                   <td className="calls">{formatNumber(callVega)}</td>
-                  <td className="calls">{formatNumber(callGamma)}</td>
+                  <td className="calls">{formatGamma(callGamma)}</td>
                   <td className="calls">{formatNumber(callTheta)}</td>
                   <td className="calls">{formatNumber(callDelta)}</td>
                   <td className={`calls ${highlights[row.strike]?.call || ""}`}>
@@ -469,25 +627,47 @@ export default function OptionChainClient({
                       )}
                     </div>
                   </td>
-                  <td className="calls">
+                  <td className={`calls ${isCallWall ? "oc-has-wall" : ""}`}>
                     <div className="oi-bar call">
                       <span style={{ width: `${callOiPct}%` }} />
                     </div>
                     {formatCompact(oiLakhs(callOi))}
+                    {isCallWall && (
+                      <span className="oc-wall" title="Biggest call OI above spot: resistance">
+                        OI wall
+                      </span>
+                    )}
                   </td>
-                  <td className="calls ltp">{formatNumber(callLtp)}</td>
+                  <td
+                    className={`calls ltp ${isCallPick ? "oc-pick" : ""}`}
+                    title={isCallPick && callPick ? pickTitle(callPick) : undefined}
+                  >
+                    {isCallPick && <span className="oc-star">★</span>}
+                    {formatNumber(callLtp)}
+                  </td>
                   <td className={isAtm ? "strike strike-atm" : "strike"}>
                     <div className="strike-main">{formatNumber(row.strike)}</div>
                     <div className={`strike-pcr ${strikePcrTone}`}>
                       PCR: {strikePcr === null ? "-" : strikePcr.toFixed(2)}
                     </div>
                   </td>
-                  <td className="puts ltp">{formatNumber(putLtp)}</td>
-                  <td className="puts">
+                  <td
+                    className={`puts ltp ${isPutPick ? "oc-pick" : ""}`}
+                    title={isPutPick && putPick ? pickTitle(putPick) : undefined}
+                  >
+                    {isPutPick && <span className="oc-star">★</span>}
+                    {formatNumber(putLtp)}
+                  </td>
+                  <td className={`puts ${isPutWall ? "oc-has-wall" : ""}`}>
                     <div className="oi-bar put">
                       <span style={{ width: `${putOiPct}%` }} />
                     </div>
                     {formatCompact(oiLakhs(putOi))}
+                    {isPutWall && (
+                      <span className="oc-wall" title="Biggest put OI below spot: support">
+                        OI wall
+                      </span>
+                    )}
                   </td>
                   <td className={`puts ${highlights[row.strike]?.put || ""}`}>
                     <div className={`oi-bar put ${(putOiChg ?? 0) >= 0 ? "pos" : "neg"}`}>
@@ -507,7 +687,7 @@ export default function OptionChainClient({
                   </td>
                   <td className="puts">{formatNumber(putDelta)}</td>
                   <td className="puts">{formatNumber(putTheta)}</td>
-                  <td className="puts">{formatNumber(putGamma)}</td>
+                  <td className="puts">{formatGamma(putGamma)}</td>
                   <td className="puts">{formatNumber(putVega)}</td>
                   <td className="puts">{formatNumber(putIv)}</td>
                   <td className="puts">{formatCompact(putVol)}</td>

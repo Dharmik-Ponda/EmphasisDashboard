@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getUpstoxAccessToken } from "@/lib/upstox";
+import { upstoxCachedGet } from "@/lib/upstoxCache";
 
 const UPSTOX_API = "https://api.upstox.com/v2";
 const DEFAULT_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50";
@@ -21,6 +22,8 @@ type OptionChainRow = {
 };
 
 const MAX_PCR_RECORDS = 2000;
+// Bump when the PCR formula changes so rows from the old formula are dropped from history.
+const PCR_FORMULA_VERSION = 2;
 let pcrRecords: any[] = [];
 const DEDUPE_FIELDS = [
   "PE Total OI Change",
@@ -45,43 +48,22 @@ async function upstoxGet(path: string, params: Record<string, string>, token: st
   for (const [k, v] of Object.entries(params)) {
     url.searchParams.set(k, v);
   }
-  const res = await fetch(url.toString(), {
-    headers: {
-      Accept: "application/json",
-      "Api-Version": "2.0",
-      Authorization: `Bearer ${token}`
-    }
-  });
-  const data = await res.json().catch(() => ({}));
-  return { ok: res.ok, data };
+  const res = await upstoxCachedGet(url.toString(), token);
+  return { ok: res.ok, data: res.data };
 }
 
 async function upstoxLtp(instrumentKeys: string[], token: string) {
   const url = new URL(`${UPSTOX_API}/market-quote/ltp`);
   url.searchParams.set("instrument_key", instrumentKeys.join(","));
-  const res = await fetch(url.toString(), {
-    headers: {
-      Accept: "application/json",
-      "Api-Version": "2.0",
-      Authorization: `Bearer ${token}`
-    }
-  });
-  const data = await res.json().catch(() => ({}));
-  return { ok: res.ok, data };
+  const res = await upstoxCachedGet(url.toString(), token);
+  return { ok: res.ok, data: res.data };
 }
 
 async function upstoxQuote(instrumentKeys: string[], token: string) {
   const url = new URL(`${UPSTOX_API}/market-quote/quotes`);
   url.searchParams.set("instrument_key", instrumentKeys.join(","));
-  const res = await fetch(url.toString(), {
-    headers: {
-      Accept: "application/json",
-      "Api-Version": "2.0",
-      Authorization: `Bearer ${token}`
-    }
-  });
-  const data = await res.json().catch(() => ({}));
-  return { ok: res.ok, data };
+  const res = await upstoxCachedGet(url.toString(), token);
+  return { ok: res.ok, data: res.data };
 }
 
 async function resolveLtpAndVwap(
@@ -185,14 +167,14 @@ function trendStrength(changePcr: number) {
   return "STRONG SELLING PRESSURE";
 }
 
-function directionalChangePcr(putChange: number, callChange: number) {
-  const bullishPressure = Math.max(putChange, 0) + Math.max(-callChange, 0);
-  const bearishPressure = Math.max(callChange, 0) + Math.max(-putChange, 0);
+// Safety cap for the change-PCR (the old pressure ratio could blow up to e.g. 34124285).
+const CHANGE_PCR_MAX = 10;
+const CHANGE_PCR_MIN = 1 / CHANGE_PCR_MAX;
 
-  if (bullishPressure === 0 && bearishPressure === 0) return 1;
-  if (bearishPressure === 0) return bullishPressure;
-
-  return bullishPressure / bearishPressure;
+function pcrVsOpen(peNow: number, ceNow: number, peOpen: number, ceOpen: number) {
+  if (peNow <= 0 || ceNow <= 0 || peOpen <= 0 || ceOpen <= 0) return 1;
+  const ratio = peNow / ceNow / (peOpen / ceOpen);
+  return Math.min(CHANGE_PCR_MAX, Math.max(CHANGE_PCR_MIN, ratio));
 }
 
 function formatVolume(value: number) {
@@ -299,7 +281,7 @@ export async function GET(req: Request) {
   const ltpData = ltpRes.ok
     ? ltpRes.data?.data?.data || ltpRes.data?.data || {}
     : {};
-  const underlying = underlyingRes.last;
+  const underlying = underlyingRes.last ?? spotFromChainRows(rows as any[]);
   const vix = extractLastFromLtpData(ltpData, vixKey);
   const vwap = underlyingRes.vwap;
   const vwapSignal =
@@ -335,6 +317,15 @@ export async function GET(req: Request) {
     Math.min(sorted.length, safeIndex + 3)
   ); // ATM ±2
 
+  // OI now and OI at open (prev_oi) per window, for the "PCR now ÷ PCR at open" measure.
+  let pe_all_oi_now = 0;
+  let ce_all_oi_now = 0;
+  let pe_all_oi_open = 0;
+  let ce_all_oi_open = 0;
+  let pe_focus_oi_now = 0;
+  let ce_focus_oi_now = 0;
+  let pe_focus_oi_open = 0;
+  let ce_focus_oi_open = 0;
   let pe_all_oi_change_total = 0; // puts (buyers)
   let pe_oi_lakh_total = 0;
   let ce_all_oi_change_total = 0; // calls (sellers)
@@ -370,8 +361,10 @@ export async function GET(req: Request) {
     pe_all_oi_change_total += putOiChg;
     ce_all_oi_change_total += callOiChg;
 
-    pe_oi_lakh_total += putOi;
-    ce_oi_lakh_total += callOi;
+    pe_all_oi_now += putOi;
+    ce_all_oi_now += callOi;
+    pe_all_oi_open += putOi - putOiChg;
+    ce_all_oi_open += callOi - callOiChg;
 
     const strike = getStrike(row);
     const peBuildUpRanks = updateTopTwoBuildUps(
@@ -419,8 +412,13 @@ export async function GET(req: Request) {
 
     pe_oi_change_total += putOiChg;
     ce_oi_change_total += callOiChg;
+    // "Current All OI PCR" = ATM ±2 only (it was summing ±5 and ±2 together before).
     pe_oi_lakh_total += putOi;
     ce_oi_lakh_total += callOi;
+    pe_focus_oi_now += putOi;
+    ce_focus_oi_now += callOi;
+    pe_focus_oi_open += putOi - putOiChg;
+    ce_focus_oi_open += callOi - callOiChg;
     sellers_volume_count_total += putVol;
     buyers_volume_count_total += callVol;
   }
@@ -428,8 +426,17 @@ export async function GET(req: Request) {
   // Change-based PCR needs sign-aware handling:
   // PE build-up and CE unwinding are bullish pressure,
   // CE build-up and PE unwinding are bearish pressure.
-  const all_pcr = directionalChangePcr(pe_all_oi_change_total, ce_all_oi_change_total);
-  const current_change_pcr = directionalChangePcr(pe_oi_change_total, ce_oi_change_total);
+  // Change PCR = PCR now ÷ PCR at today's open (same strikes).
+  // > 1 = put writing / call unwinding since open (bullish), < 1 = the opposite.
+  // Unlike the old bullish÷bearish pressure ratio it never gets stuck at the cap
+  // when the whole day's flow is one-sided.
+  const all_pcr = pcrVsOpen(pe_all_oi_now, ce_all_oi_now, pe_all_oi_open, ce_all_oi_open);
+  const current_change_pcr = pcrVsOpen(
+    pe_focus_oi_now,
+    ce_focus_oi_now,
+    pe_focus_oi_open,
+    ce_focus_oi_open
+  );
   const current_all_pcr = pe_oi_lakh_total / (ce_oi_lakh_total || 1);
 
   let pcrSignal = "Neutral zone";
@@ -467,6 +474,7 @@ export async function GET(req: Request) {
       : { side: "CE" as const, strike: minCeStrike, oiChange: minCeOiChange };
 
   const record = {
+    formula: PCR_FORMULA_VERSION,
     Time: new Date().toLocaleTimeString("en-IN", {
       timeZone: "Asia/Kolkata",
       hour12: true
@@ -484,6 +492,7 @@ export async function GET(req: Request) {
     "Top OI Decrease Value": Number.isFinite(topOiDecrease.oiChange) ? topOiDecrease.oiChange : 0
   };
 
+  pcrRecords = pcrRecords.filter((existing) => existing?.formula === PCR_FORMULA_VERSION);
   const isDuplicate = pcrRecords.some((existing) =>
     DEDUPE_FIELDS.every((field) => existing?.[field] === record[field])
   );
@@ -524,4 +533,24 @@ export async function GET(req: Request) {
       { status: 500 }
     );
   }
+}
+
+// Spot fallbacks when the Upstox LTP call fails:
+// 1) underlying_spot_price that Upstox puts on every option-chain row,
+// 2) put-call parity at the strike where call ≈ put: spot ≈ strike + call − put.
+function spotFromChainRows(rows: any[]): number | null {
+  for (const r of rows) {
+    const v = Number(r?.underlying_spot_price);
+    if (Number.isFinite(v) && v > 0) return v;
+  }
+  let best: { diff: number; spot: number } | null = null;
+  for (const r of rows) {
+    const k = typeof r?.strike_price === "number" ? r.strike_price : Number(r?.strike);
+    const c = Number(r?.call_options?.market_data?.ltp ?? r?.call_options?.ltp);
+    const p = Number(r?.put_options?.market_data?.ltp ?? r?.put_options?.ltp);
+    if (!Number.isFinite(k) || !(c > 0) || !(p > 0)) continue;
+    const diff = Math.abs(c - p);
+    if (!best || diff < best.diff) best = { diff, spot: k + c - p };
+  }
+  return best ? best.spot : null;
 }

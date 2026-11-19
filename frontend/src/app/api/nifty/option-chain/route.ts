@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getUpstoxAccessToken } from "@/lib/upstox";
+import { upstoxCachedGet } from "@/lib/upstoxCache";
 
 const UPSTOX_API = "https://api.upstox.com/v2";
 const DEFAULT_INSTRUMENT_KEY = "NSE_INDEX|Nifty 50";
@@ -43,29 +44,15 @@ async function upstoxGet(path: string, params: Record<string, string>, token: st
   for (const [k, v] of Object.entries(params)) {
     url.searchParams.set(k, v);
   }
-  const res = await fetch(url.toString(), {
-    headers: {
-      Accept: "application/json",
-      "Api-Version": "2.0",
-      Authorization: `Bearer ${token}`
-    }
-  });
-  const data = await res.json().catch(() => ({}));
-  return { ok: res.ok, data };
+  const res = await upstoxCachedGet(url.toString(), token);
+  return { ok: res.ok, data: res.data };
 }
 
 async function upstoxLtp(instrumentKeys: string[], token: string) {
   const url = new URL(`${UPSTOX_API}/market-quote/ltp`);
   url.searchParams.set("instrument_key", instrumentKeys.join(","));
-  const res = await fetch(url.toString(), {
-    headers: {
-      Accept: "application/json",
-      "Api-Version": "2.0",
-      Authorization: `Bearer ${token}`
-    }
-  });
-  const data = await res.json().catch(() => ({}));
-  return { ok: res.ok, data };
+  const res = await upstoxCachedGet(url.toString(), token);
+  return { ok: res.ok, data: res.data };
 }
 
 async function upstoxCandles(
@@ -78,16 +65,9 @@ async function upstoxCandles(
   const from = new Date();
   from.setDate(from.getDate() - lookbackDays);
   const url = `${UPSTOX_API}/historical-candle/${encodeURIComponent(instrumentKey)}/${interval}/${formatDate(to)}/${formatDate(from)}`;
-  const res = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "Api-Version": "2.0",
-      Authorization: `Bearer ${token}`
-    }
-  });
+  const res = await upstoxCachedGet(url, token);
   if (!res.ok) return null;
-  const data = await res.json().catch(() => ({}));
-  return data?.data?.candles || [];
+  return res.data?.data?.candles || [];
 }
 
 function normalizeCandles(candles: any[]): PriceCandle[] {
@@ -322,6 +302,7 @@ export async function GET(req: Request) {
   const underlyingSpot =
     underlyingFromLtp ||
     chainSpotRaw ||
+    spotFromChainRows(rows as any[]) ||
     null;
 
   const atm = underlyingSpot
@@ -396,4 +377,24 @@ export async function GET(req: Request) {
     priceHistory5m,
     priceHistory15m
   });
+}
+
+// Spot fallbacks when the Upstox LTP call fails:
+// 1) underlying_spot_price that Upstox puts on every option-chain row,
+// 2) put-call parity at the strike where call ≈ put: spot ≈ strike + call − put.
+function spotFromChainRows(rows: any[]): number | null {
+  for (const r of rows) {
+    const v = Number(r?.underlying_spot_price);
+    if (Number.isFinite(v) && v > 0) return v;
+  }
+  let best: { diff: number; spot: number } | null = null;
+  for (const r of rows) {
+    const k = typeof r?.strike_price === "number" ? r.strike_price : Number(r?.strike);
+    const c = Number(r?.call_options?.market_data?.ltp ?? r?.call_options?.ltp);
+    const p = Number(r?.put_options?.market_data?.ltp ?? r?.put_options?.ltp);
+    if (!Number.isFinite(k) || !(c > 0) || !(p > 0)) continue;
+    const diff = Math.abs(c - p);
+    if (!best || diff < best.diff) best = { diff, spot: k + c - p };
+  }
+  return best ? best.spot : null;
 }
